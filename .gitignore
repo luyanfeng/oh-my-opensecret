@@ -1,0 +1,7 @@
+node_modules/
+.test-tmp/
+~/
+progress.md
+findings.md
+config.json
+*.log

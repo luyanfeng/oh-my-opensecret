@@ -1,0 +1,28 @@
+{
+  "name": "oh-my-opensecret",
+  "version": "0.1.0",
+  "description": "OpenCode 隐私脱敏插件：自动识别并替换敏感信息，保证 LLM 提供商看不见明文，同时本机工具执行不受影响",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": "./src/index.js",
+  "files": [
+    "src",
+    "oh-my-opensecret.yaml.example"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "prepack": "npm test"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "privacy",
+    "redaction",
+    "secrets",
+    "pii"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "js-yaml": "^4.1.0"
+  }
+}
