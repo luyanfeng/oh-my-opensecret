@@ -24,7 +24,7 @@ const TEST_KEYS = {
     placeholderId: "OPENAI_KEY",
   },
   openai_proj: {
-    raw: "sk-proj-" + "a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v",
+    raw: "sk-proj-" + "x".repeat(156),
     desc: "OpenAI Project Key (sk-proj- + longer)",
     placeholderId: "OPENAI_KEY",
   },

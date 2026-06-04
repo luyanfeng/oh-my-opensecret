@@ -65,9 +65,10 @@ const BUILTIN = new Map([
   [
     "openai_key",
     {
-      description: "OpenAI API Key（sk-... / sk-proj-...）",
-      // sk- + 48 chars (legacy, 固定), sk-proj- + 44~156 chars (project)
-      pattern: String.raw`sk-(?:proj-)?[A-Za-z0-9]{43,156}`,
+      description: "OpenAI API Key（sk-... / sk-proj-... / sk-svcacct-...）",
+      // sk-proj- / sk-svcacct- + 30~156 (project/service account, 含 _ -)
+      // sk- + 48~156 (legacy, 纯字母数字)
+      pattern: String.raw`(?:sk-(?:proj-|svcacct-)[A-Za-z0-9_-]{156}|sk-[A-Za-z0-9]{48,156})`,
       placeholderId: "OPENAI_KEY",
     },
   ],
@@ -193,8 +194,8 @@ const BUILTIN = new Map([
   [
     "zhipu_key",
     {
-      description: "智谱 GLM API Key（xxx.xxx 双段格式）",
-      pattern: String.raw`[A-Za-z0-9]{32,}\.[A-Za-z0-9]{32,}`,
+      description: "智谱 GLM API Key（32hex.22base64 双段格式）",
+      pattern: String.raw`[A-Za-z0-9]{32}\.[A-Za-z0-9]{16}`,
       placeholderId: "ZHIPU_KEY",
     },
   ],
