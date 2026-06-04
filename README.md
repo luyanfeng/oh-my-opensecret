@@ -68,6 +68,8 @@
 
 ## 内置规则
 
+内置规则仅覆盖通用 PII，不包含任何平台 API Key。API Key 请在 YAML 配置的 `patterns.regex` 中自行添加。
+
 | 规则 | 匹配内容 | 示例 |
 |------|---------|------|
 | `email` | 邮箱地址 | `user@example.com` |
@@ -75,30 +77,10 @@
 | `china_id` | 中国大陆身份证号 | `110101199001011234` |
 | `uuid` | UUID v4 | `550e8400-e29b-41d4-...` |
 | `ipv4` | IPv4 地址 | `192.168.1.1` |
-| `ipv6` | IPv6 地址 | `2001:db8::1` |
+| `ipv6` | IPv6 地址（全写） | `2001:db8::1` |
 | `mac` | MAC 地址 | `aa:bb:cc:dd:ee:ff` |
 | `jwt` | JWT Token | `eyJxxx.eyJxxx.xxx` |
 | `db_connection` | 数据库连接串 | `mysql://user:pass@host` |
-| `openai_key` | OpenAI API Key | `sk-...` / `sk-proj-...` |
-| `openai_org_id` | OpenAI 组织 ID | `org-...` |
-| `github_token` | GitHub 令牌 | `ghp_...` / `github_pat_...` |
-| `aws_key` | AWS Access Key | `AKIA...` |
-| `anthropic_key` | Anthropic API Key | `sk-ant-...` |
-| `google_key` | Google API Key | `AIza...` |
-| `stripe_key` | Stripe API Key | `sk_live_...` / `sk_test_...` |
-| `hf_token` | HuggingFace Token | `hf_...` |
-| `pplx_key` | Perplexity API Key | `pplx-...` |
-| `groq_key` | Groq API Key | `gsk_...` |
-| `gitlab_token` | GitLab PAT | `glpat-...` |
-| `replicate_key` | Replicate Token | `r8_...` |
-| `bailian_key` | 阿里云百炼 Coding Plan Key | `sk-sp-...` |
-| `zhipu_key` | 智谱 GLM API Key | 双段格式 |
-| `deepseek_key`¹ | DeepSeek API Key | `sk-...` |
-| `moonshot_key`¹ | 月之暗面 Kimi API Key | `sk-...` |
-| `baidu_key`¹ | 百度千帆 API Key | `sk-...` |
-| `siliconflow_key`¹ | 硅基流动 API Key | `sk-...` |
-
-> ¹ 标 ¹ 的平台兼容 OpenAI 格式（`sk-xxx`），已由 `openai_key` 规则兜底覆盖，无需额外启用。
 
 ## 场景 Profile
 

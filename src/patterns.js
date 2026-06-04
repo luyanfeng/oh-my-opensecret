@@ -48,8 +48,8 @@ const BUILTIN = new Map([
   [
     "ipv6",
     {
-      description: "IPv6 地址（全写/省略/::压缩）",
-      pattern: String.raw`/(?<![0-9a-fA-F:])((?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|((?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4})?::(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6})?)(?![0-9a-fA-F:])/`,
+      description: "IPv6 地址（全写: 8组4位hex）",
+      pattern: String.raw`/(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}/`,
       placeholderId: "IPV6",
     },
   ],
@@ -69,142 +69,12 @@ const BUILTIN = new Map([
       placeholderId: "JWT",
     },
   ],
-  // ---- API Key 规则 ----
-  [
-    "openai_key",
-    {
-      description: "OpenAI API Key（sk-... / sk-proj-... / sk-svcacct-...）",
-      // sk-proj- / sk-svcacct- + 30~156 (project/service account, 含 _ -)
-      // sk- + 48~156 (legacy, 纯字母数字)
-      pattern: String.raw`(?:sk-(?:proj-|svcacct-)[A-Za-z0-9_-]{156}|sk-[A-Za-z0-9]{48,156})`,
-      placeholderId: "OPENAI_KEY",
-    },
-  ],
-  [
-    "openai_org_id",
-    {
-      description: "OpenAI 组织 ID（org-...）",
-      // org- + 24 hex chars
-      pattern: String.raw`org-[A-Za-z0-9]{24}`,
-      placeholderId: "OPENAI_ORG",
-    },
-  ],
-  [
-    "github_token",
-    {
-      description: "GitHub 令牌（ghp_... / gho_... / github_pat_...）",
-      // ghp_/gho_/ghu_/ghs_/ghr_ + 36 = 40（官方）
-      // github_pat_ + 可变长度
-      pattern: String.raw`(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_-]{20,80})`,
-      placeholderId: "GITHUB_TOKEN",
-    },
-  ],
-  [
-    "aws_key",
-    {
-      description: "AWS Access Key（AKIA...）",
-      pattern: String.raw`AKIA[0-9A-Z]{16}`,
-      placeholderId: "AWS_ACCESS_KEY",
-    },
-  ],
-  [
-    "anthropic_key",
-    {
-      description: "Anthropic API Key（sk-ant-...）",
-      // 新格式: sk-ant-api03- + 93 chars + AA = 108
-      // 旧格式: sk-ant- + 至少 48 chars
-      pattern: String.raw`sk-ant-(?:api03-)?[A-Za-z0-9]{48,93}(?:AA)?`,
-      placeholderId: "ANTHROPIC_KEY",
-    },
-  ],
-  [
-    "google_key",
-    {
-      description: "Google API Key（AIza...）",
-      // AIzaSy + 33 chars = 39, 或 AIza + 35 chars = 39
-      pattern: String.raw`AIza(?:Sy[A-Za-z0-9_-]{33}|[A-Za-z0-9_-]{35})`,
-      placeholderId: "GOOGLE_KEY",
-    },
-  ],
-  [
-    "stripe_key",
-    {
-      description: "Stripe API Key（sk_live_... / sk_test_...）",
-      // sk_test_ / sk_live_ + 24 chars = 32
-      pattern: String.raw`sk_(?:test|live)_[A-Za-z0-9]{24}`,
-      placeholderId: "STRIPE_KEY",
-    },
-  ],
-  [
-    "hf_token",
-    {
-      description: "HuggingFace Token（hf_...）",
-      // hf_ + 34 chars 或 hf_ + 40 chars
-      pattern: String.raw`hf_[A-Za-z0-9]{34}(?:[A-Za-z0-9]{6})?`,
-      placeholderId: "HF_TOKEN",
-    },
-  ],
-  [
-    "pplx_key",
-    {
-      description: "Perplexity API Key（pplx-...）",
-      pattern: String.raw`pplx-[A-Za-z0-9]{16,48}`,
-      placeholderId: "PPLX_KEY",
-    },
-  ],
-  [
-    "groq_key",
-    {
-      description: "Groq API Key（gsk_...）",
-      // gsk_ + 52 chars = 56（官方）
-      pattern: String.raw`gsk_[A-Za-z0-9_\-]{52}`,
-      placeholderId: "GROQ_KEY",
-    },
-  ],
-  [
-    "gitlab_token",
-    {
-      description: "GitLab 个人访问令牌（glpat-...）",
-      // glpat- + 14 chars = 20（官方说 20 字符总长，含前缀）
-      pattern: String.raw`glpat-[A-Za-z0-9\-]{14}`,
-      placeholderId: "GITLAB_TOKEN",
-    },
-  ],
-  [
-    "replicate_key",
-    {
-      description: "Replicate API Token（r8_...）",
-      // r8_ + 37 chars = 40（官方明确说 40 字符）
-      pattern: String.raw`r8_[A-Za-z0-9_\-]{37}`,
-      placeholderId: "REPLICATE_KEY",
-    },
-  ],
   [
     "db_connection",
     {
       description: "数据库连接字符串（mysql/postgres/mongodb/redis://user:pass@）",
       pattern: String.raw`(?:mysql|postgres|mongodb|redis)://[^:]+:[^@]+@`,
       placeholderId: "DB_CONNECTION",
-    },
-  ],
-  // ---- 国内平台 API Key 规则 ----
-  // 注：多数国内平台兼容 OpenAI 格式（sk-xxx），已被 openai_key 规则兜底。
-  // 以下规则仅添加有独立格式或常用平台，便于日志区分。
-  [
-    "bailian_key",
-    {
-      description: "阿里云百炼 API Key（sk- + 32 hex / sk-sp- + 32+）",
-      // 通用 key: sk- + 32 hex = 35, Coding Plan: sk-sp- + 32+
-      pattern: String.raw`sk-(?:sp-)?[A-Za-z0-9]{32,64}`,
-      placeholderId: "BAILIAN_KEY",
-    },
-  ],
-  [
-    "zhipu_key",
-    {
-      description: "智谱 GLM API Key（32hex.22base64 双段格式）",
-      pattern: String.raw`[A-Za-z0-9]{32}\.[A-Za-z0-9]{16}`,
-      placeholderId: "ZHIPU_KEY",
     },
   ],
 ])

@@ -325,28 +325,18 @@ patterns:
 
   # ---------- 内置规则 ----------
   # 按名称引用 src/patterns.js 中预定义的规则。
-  # 每条规则的脱敏占位符前缀即其 placeholderId（如 email → __OMOS_EMAIL_xxx__）。
+  # 内置规则仅覆盖通用 PII 类信息，不包含任何平台 API Key。
+  # API Key 请在自定义 regex 中添加。
   #
-  # 完整列表（含匹配内容简介）:
+  # 可用内置规则:
   #   email           邮箱地址
   #   china_phone     中国大陆手机号（1xx-xxxx-xxxx）
   #   china_id        中国大陆身份证号（18位数字+X）
   #   uuid            UUID v4 格式
   #   ipv4            IPv4 地址
+  #   ipv6            IPv6 地址
   #   mac             MAC 地址（xx:xx:xx:xx:xx:xx）
   #   jwt             JWT Token（eyJxxx.eyJxxx.xxx）
-  #   openai_key      OpenAI API Key（sk-... / sk-proj-...）
-  #   openai_org_id   OpenAI 组织 ID（org-...）
-  #   github_token    GitHub 令牌（ghp_... / gho_... / github_pat_...）
-  #   aws_key         AWS Access Key（AKIA...）
-  #   anthropic_key   Anthropic API Key（sk-ant-...）
-  #   google_key      Google API Key（AIza...）
-  #   stripe_key      Stripe API Key（sk_live_... / sk_test_...）
-  #   hf_token        HuggingFace Token（hf_...）
-  #   pplx_key        Perplexity API Key（pplx-...）
-  #   groq_key        Groq API Key（gsk_...）
-  #   gitlab_token    GitLab 个人访问令牌（glpat-...）
-  #   replicate_key   Replicate API Token（r8_...）
   #   db_connection   数据库连接字符串（mysql://user:pass@host 等）
   #
   # 下行为默认启用列表，按需增删即可：
@@ -358,6 +348,8 @@ patterns:
     - ipv4
     - ipv6
     - mac
+    - jwt
+    - db_connection
 
   # ---------- 排除列表（豁免）----------
   # 以下内容即使匹配规则也不会被脱敏
@@ -406,9 +398,6 @@ profiles:
         - ipv4
         - ipv6
         - mac
-        - github_token
-        - openai_key
-        - aws_key
       regex:
         - pattern: "(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]+"
           placeholder-id: "GITHUB_TOKEN"

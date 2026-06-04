@@ -4,6 +4,7 @@ import * as fs from "node:fs/promises"
 import * as path from "node:path"
 import { fileURLToPath } from "node:url"
 import crypto from "node:crypto"
+import yaml from "js-yaml"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const TMP = path.join(__dirname, "..", ".test-tmp", "acceptance")
@@ -209,16 +210,36 @@ async function createTestEnv(keys) {
   const dir = path.join(TMP, crypto.randomBytes(4).toString("hex"))
   await fs.mkdir(dir, { recursive: true })
 
-  // 写插件配置：全部内置规则启用
-  const allBuiltins = [
-    "email", "china_phone", "china_id", "uuid", "jwt",
-    "ipv4", "mac",
-    "github_token", "openai_key", "openai_org_id", "aws_key",
-    "anthropic_key", "google_key", "stripe_key", "hf_token",
-    "pplx_key", "groq_key", "gitlab_token", "replicate_key",
-    "db_connection",
-  ]
-  const cfgYaml = `enabled: true\nauto_discovery: false\nplaceholder_prefix: "__OMOS_"\npatterns:\n  builtin:\n${allBuiltins.map((n) => `    - ${n}`).join("\n")}\n  keywords: []\n  exclude: []`
+  // 写插件配置：内置规则（仅通用PII）+ 自定义 API Key 正则
+  const cfg = {
+    enabled: true,
+    auto_discovery: false,
+    placeholder_prefix: "__OMOS_",
+    patterns: {
+      builtin: [
+        "email", "china_phone", "china_id", "uuid", "jwt",
+        "ipv4", "ipv6", "mac", "db_connection",
+      ],
+      regex: [
+        { pattern: "(?:sk-(?:proj-|svcacct-)[A-Za-z0-9_-]{156}|sk-[A-Za-z0-9]{48,156})", "placeholder-id": "OPENAI_KEY" },
+        { pattern: "org-[A-Za-z0-9]{24}", "placeholder-id": "OPENAI_ORG" },
+        { pattern: "(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_-]{20,80})", "placeholder-id": "GITHUB_TOKEN" },
+        { pattern: "AKIA[0-9A-Z]{16}", "placeholder-id": "AWS_ACCESS_KEY" },
+        { pattern: "sk-ant-(?:api03-)?[A-Za-z0-9]{48,93}(?:AA)?", "placeholder-id": "ANTHROPIC_KEY" },
+        { pattern: "AIza(?:Sy[A-Za-z0-9_-]{33}|[A-Za-z0-9_-]{35})", "placeholder-id": "GOOGLE_KEY" },
+        { pattern: "sk_(?:test|live)_[A-Za-z0-9]{24}", "placeholder-id": "STRIPE_KEY" },
+        { pattern: "hf_[A-Za-z0-9]{34}(?:[A-Za-z0-9]{6})?", "placeholder-id": "HF_TOKEN" },
+        { pattern: "pplx-[A-Za-z0-9]{16,48}", "placeholder-id": "PPLX_KEY" },
+        { pattern: "gsk_[A-Za-z0-9_\\-]{52}", "placeholder-id": "GROQ_KEY" },
+        { pattern: "glpat-[A-Za-z0-9\\-]{14}", "placeholder-id": "GITLAB_TOKEN" },
+        { pattern: "r8_[A-Za-z0-9_\\-]{37}", "placeholder-id": "REPLICATE_KEY" },
+        { pattern: "sk-[A-Za-z0-9]{32}", "placeholder-id": "BAILIAN_KEY" },
+      ],
+      keywords: [],
+      exclude: [],
+    },
+  }
+  const cfgYaml = yaml.dump(cfg)
   await fs.writeFile(path.join(dir, "oh-my-opensecret.yaml"), cfgYaml, "utf8")
 
   return dir
