@@ -46,6 +46,14 @@ const BUILTIN = new Map([
     },
   ],
   [
+    "ipv6",
+    {
+      description: "IPv6 地址（全写/省略/::压缩）",
+      pattern: String.raw`/(?<![0-9a-fA-F:])((?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|((?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{1,4})?::(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){0,6})?)(?![0-9a-fA-F:])/`,
+      placeholderId: "IPV6",
+    },
+  ],
+  [
     "mac",
     {
       description: "MAC 地址（xx:xx:xx:xx:xx:xx）",

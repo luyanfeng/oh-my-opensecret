@@ -356,6 +356,7 @@ patterns:
     - china_id
     - uuid
     - ipv4
+    - ipv6
     - mac
 
   # ---------- 排除列表（豁免）----------
@@ -403,6 +404,7 @@ profiles:
         - uuid
         - jwt
         - ipv4
+        - ipv6
         - mac
         - github_token
         - openai_key

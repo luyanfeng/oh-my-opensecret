@@ -75,6 +75,7 @@
 | `china_id` | 中国大陆身份证号 | `110101199001011234` |
 | `uuid` | UUID v4 | `550e8400-e29b-41d4-...` |
 | `ipv4` | IPv4 地址 | `192.168.1.1` |
+| `ipv6` | IPv6 地址 | `2001:db8::1` |
 | `mac` | MAC 地址 | `aa:bb:cc:dd:ee:ff` |
 | `jwt` | JWT Token | `eyJxxx.eyJxxx.xxx` |
 | `db_connection` | 数据库连接串 | `mysql://user:pass@host` |
