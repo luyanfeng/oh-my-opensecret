@@ -34,7 +34,7 @@ const TEST_KEYS = {
     placeholderId: "API_KEY",
   },
   google_ai: {
-    raw: "AIzaSy" + crypto.randomBytes(20).toString("hex").slice(0, 28),
+    raw: "AIzaSy" + crypto.randomBytes(17).toString("hex").slice(0, 33),
     desc: "Google AI / Gemini Key (AIzaSy + chars)",
     placeholderId: "API_KEY",
   },
@@ -71,7 +71,7 @@ const TEST_KEYS = {
     placeholderId: "API_KEY",
   },
   groq: {
-    raw: "gsk_" + crypto.randomBytes(32).toString("base64url"),
+    raw: "gsk_" + crypto.randomBytes(39).toString("base64url"),
     desc: "Groq Key (gsk_ + base64url)",
     placeholderId: "API_KEY",
   },
@@ -83,7 +83,7 @@ const TEST_KEYS = {
 
   // ---------- Platform Tokens ----------
   github: {
-    raw: "ghp_" + crypto.randomBytes(20).toString("hex"),
+    raw: "ghp_" + crypto.randomBytes(18).toString("hex"),
     desc: "GitHub Personal Token (ghp_ + hex)",
     placeholderId: "GITHUB_TOKEN",
   },
@@ -196,7 +196,7 @@ const TEST_KEYS = {
     placeholderId: "OPENAI_KEY",
   },
   multiple_keys_line: {
-    raw: "ghp_abc123def456ghi789jkl012 and AKIAIOSFODNN7EXAMPLE",
+    raw: "ghp_abc123def456ghi789jkl012mno345pqr678stu and AKIAIOSFODNN7EXAMPLE",
     desc: "GitHub + AWS keys on same line",
     placeholderId: null, // special handling: both should be redacted
   },

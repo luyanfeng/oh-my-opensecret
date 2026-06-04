@@ -85,9 +85,9 @@ const BUILTIN = new Map([
     "github_token",
     {
       description: "GitHub 令牌（ghp_... / gho_... / github_pat_...）",
-      // ghp_/gho_/ghu_/ghs_/ghr_ + 24~36 = 28~40
+      // ghp_/gho_/ghu_/ghs_/ghr_ + 36 = 40（官方）
       // github_pat_ + 可变长度
-      pattern: String.raw`(?:gh[pousr]_[A-Za-z0-9]{24,36}|github_pat_[A-Za-z0-9_-]{20,80})`,
+      pattern: String.raw`(?:gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_-]{20,80})`,
       placeholderId: "GITHUB_TOKEN",
     },
   ],
@@ -113,8 +113,8 @@ const BUILTIN = new Map([
     "google_key",
     {
       description: "Google API Key（AIza...）",
-      // AIzaSy + 33 chars = 39（官方）, 也兼容较短测试值
-      pattern: String.raw`AIza(?:Sy)?[A-Za-z0-9_-]{28,35}`,
+      // AIzaSy + 33 chars = 39, 或 AIza + 35 chars = 39
+      pattern: String.raw`AIza(?:Sy[A-Za-z0-9_-]{33}|[A-Za-z0-9_-]{35})`,
       placeholderId: "GOOGLE_KEY",
     },
   ],
@@ -148,8 +148,8 @@ const BUILTIN = new Map([
     "groq_key",
     {
       description: "Groq API Key（gsk_...）",
-      // gsk_ + 40~52 chars（含 _ 和 -）
-      pattern: String.raw`gsk_[A-Za-z0-9_\-]{40,52}`,
+      // gsk_ + 52 chars = 56（官方）
+      pattern: String.raw`gsk_[A-Za-z0-9_\-]{52}`,
       placeholderId: "GROQ_KEY",
     },
   ],
