@@ -90,6 +90,14 @@
 | `groq_key` | Groq API Key | `gsk_...` |
 | `gitlab_token` | GitLab PAT | `glpat-...` |
 | `replicate_key` | Replicate Token | `r8_...` |
+| `bailian_key` | 阿里云百炼 Coding Plan Key | `sk-sp-...` |
+| `zhipu_key` | 智谱 GLM API Key | 双段格式 |
+| `deepseek_key`¹ | DeepSeek API Key | `sk-...` |
+| `moonshot_key`¹ | 月之暗面 Kimi API Key | `sk-...` |
+| `baidu_key`¹ | 百度千帆 API Key | `sk-...` |
+| `siliconflow_key`¹ | 硅基流动 API Key | `sk-...` |
+
+> ¹ 标 ¹ 的平台兼容 OpenAI 格式（`sk-xxx`），已由 `openai_key` 规则兜底覆盖，无需额外启用。
 
 ## 场景 Profile
 

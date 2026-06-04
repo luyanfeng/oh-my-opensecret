@@ -168,6 +168,25 @@ const BUILTIN = new Map([
       placeholderId: "DB_CONNECTION",
     },
   ],
+  // ---- 国内平台 API Key 规则 ----
+  // 注：多数国内平台兼容 OpenAI 格式（sk-xxx），已被 openai_key 规则兜底。
+  // 以下规则仅添加有独立格式或常用平台，便于日志区分。
+  [
+    "bailian_key",
+    {
+      description: "阿里云百炼 Coding Plan Key（sk-sp-...）",
+      pattern: String.raw`sk-sp-[A-Za-z0-9]{32,}`,
+      placeholderId: "BAILIAN_KEY",
+    },
+  ],
+  [
+    "zhipu_key",
+    {
+      description: "智谱 GLM API Key（xxx.xxx 双段格式）",
+      pattern: String.raw`[A-Za-z0-9]{32,}\.[A-Za-z0-9]{32,}`,
+      placeholderId: "ZHIPU_KEY",
+    },
+  ],
 ])
 
 function sanitizeCategory(input) {
