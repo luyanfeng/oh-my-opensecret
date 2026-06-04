@@ -66,8 +66,8 @@ const BUILTIN = new Map([
     "openai_key",
     {
       description: "OpenAI API Key（sk-... / sk-proj-...）",
-      // sk- + 48 chars (legacy), sk-proj- + 32~156 chars (project)
-      pattern: String.raw`sk-(?:proj-)?[A-Za-z0-9]{32,156}`,
+      // sk- + 48 chars (legacy, 固定), sk-proj- + 44~156 chars (project)
+      pattern: String.raw`sk-(?:proj-)?[A-Za-z0-9]{43,156}`,
       placeholderId: "OPENAI_KEY",
     },
   ],
@@ -184,9 +184,9 @@ const BUILTIN = new Map([
   [
     "bailian_key",
     {
-      description: "阿里云百炼 Coding Plan Key（sk-sp-...）",
-      // sk-sp- + 32+ chars，兼容 OpenAI 格式
-      pattern: String.raw`sk-sp-[A-Za-z0-9]{32,64}`,
+      description: "阿里云百炼 API Key（sk- + 32 hex / sk-sp- + 32+）",
+      // 通用 key: sk- + 32 hex = 35, Coding Plan: sk-sp- + 32+
+      pattern: String.raw`sk-(?:sp-)?[A-Za-z0-9]{32,64}`,
       placeholderId: "BAILIAN_KEY",
     },
   ],
