@@ -66,8 +66,8 @@ const BUILTIN = new Map([
     "openai_key",
     {
       description: "OpenAI API Key（sk-... / sk-proj-...）",
-      // sk-xxx 或 sk-proj-xxx (32+ chars)
-      pattern: String.raw`sk-(?:proj-)?[A-Za-z0-9]{32,}`,
+      // sk- + 48 chars (legacy), sk-proj- + 32~156 chars (project)
+      pattern: String.raw`sk-(?:proj-)?[A-Za-z0-9]{32,156}`,
       placeholderId: "OPENAI_KEY",
     },
   ],
@@ -84,7 +84,9 @@ const BUILTIN = new Map([
     "github_token",
     {
       description: "GitHub 令牌（ghp_... / gho_... / github_pat_...）",
-      pattern: String.raw`(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9]+`,
+      // ghp_/gho_/ghu_/ghs_/ghr_ + 24~36 = 28~40
+      // github_pat_ + 可变长度
+      pattern: String.raw`(?:gh[pousr]_[A-Za-z0-9]{24,36}|github_pat_[A-Za-z0-9_-]{20,80})`,
       placeholderId: "GITHUB_TOKEN",
     },
   ],
@@ -100,7 +102,9 @@ const BUILTIN = new Map([
     "anthropic_key",
     {
       description: "Anthropic API Key（sk-ant-...）",
-      pattern: String.raw`sk-ant-[A-Za-z0-9]{32,}`,
+      // 新格式: sk-ant-api03- + 93 chars + AA = 108
+      // 旧格式: sk-ant- + 至少 48 chars
+      pattern: String.raw`sk-ant-(?:api03-)?[A-Za-z0-9]{48,93}(?:AA)?`,
       placeholderId: "ANTHROPIC_KEY",
     },
   ],
@@ -108,7 +112,8 @@ const BUILTIN = new Map([
     "google_key",
     {
       description: "Google API Key（AIza...）",
-      pattern: String.raw`AIza[0-9A-Za-z\-_]{30,}`,
+      // AIzaSy + 33 chars = 39（官方）, 也兼容较短测试值
+      pattern: String.raw`AIza(?:Sy)?[A-Za-z0-9_-]{28,35}`,
       placeholderId: "GOOGLE_KEY",
     },
   ],
@@ -116,7 +121,8 @@ const BUILTIN = new Map([
     "stripe_key",
     {
       description: "Stripe API Key（sk_live_... / sk_test_...）",
-      pattern: String.raw`sk_(?:test|live)_[A-Za-z0-9]{24,}`,
+      // sk_test_ / sk_live_ + 24 chars = 32
+      pattern: String.raw`sk_(?:test|live)_[A-Za-z0-9]{24}`,
       placeholderId: "STRIPE_KEY",
     },
   ],
@@ -124,7 +130,8 @@ const BUILTIN = new Map([
     "hf_token",
     {
       description: "HuggingFace Token（hf_...）",
-      pattern: String.raw`hf_[A-Za-z0-9]{24,}`,
+      // hf_ + 34 chars 或 hf_ + 40 chars
+      pattern: String.raw`hf_[A-Za-z0-9]{34}(?:[A-Za-z0-9]{6})?`,
       placeholderId: "HF_TOKEN",
     },
   ],
@@ -132,7 +139,7 @@ const BUILTIN = new Map([
     "pplx_key",
     {
       description: "Perplexity API Key（pplx-...）",
-      pattern: String.raw`pplx-[A-Za-z0-9]{24,}`,
+      pattern: String.raw`pplx-[A-Za-z0-9]{16,48}`,
       placeholderId: "PPLX_KEY",
     },
   ],
@@ -140,7 +147,8 @@ const BUILTIN = new Map([
     "groq_key",
     {
       description: "Groq API Key（gsk_...）",
-      pattern: String.raw`gsk_[A-Za-z0-9_\-]{24,}`,
+      // gsk_ + 40~52 chars（含 _ 和 -）
+      pattern: String.raw`gsk_[A-Za-z0-9_\-]{40,52}`,
       placeholderId: "GROQ_KEY",
     },
   ],
@@ -148,7 +156,8 @@ const BUILTIN = new Map([
     "gitlab_token",
     {
       description: "GitLab 个人访问令牌（glpat-...）",
-      pattern: String.raw`glpat-[A-Za-z0-9\-]{20,}`,
+      // glpat- + 14 chars = 20（官方说 20 字符总长，含前缀）
+      pattern: String.raw`glpat-[A-Za-z0-9\-]{14}`,
       placeholderId: "GITLAB_TOKEN",
     },
   ],
@@ -156,7 +165,8 @@ const BUILTIN = new Map([
     "replicate_key",
     {
       description: "Replicate API Token（r8_...）",
-      pattern: String.raw`r8_[A-Za-z0-9_\-]{20,}`,
+      // r8_ + 37 chars = 40（官方明确说 40 字符）
+      pattern: String.raw`r8_[A-Za-z0-9_\-]{37}`,
       placeholderId: "REPLICATE_KEY",
     },
   ],
@@ -175,7 +185,8 @@ const BUILTIN = new Map([
     "bailian_key",
     {
       description: "阿里云百炼 Coding Plan Key（sk-sp-...）",
-      pattern: String.raw`sk-sp-[A-Za-z0-9]{32,}`,
+      // sk-sp- + 32+ chars，兼容 OpenAI 格式
+      pattern: String.raw`sk-sp-[A-Za-z0-9]{32,64}`,
       placeholderId: "BAILIAN_KEY",
     },
   ],
