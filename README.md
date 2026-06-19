@@ -82,14 +82,6 @@
 | `jwt` | JWT Token | `eyJxxx.eyJxxx.xxx` |
 | `db_connection` | 数据库连接串 | `mysql://user:pass@host` |
 
-## 场景 Profile
-
-通过 `profile` 字段切换不同脱敏策略：
-
-- **`daily`** — 轻量脱敏，只处理常见 PII（邮箱、手机号、UUID），适合日常对话
-- **`code_review`** — 全面脱敏，覆盖所有内置规则，适合分享代码片段
-- **`ci_cd`** — 重点保护密钥和令牌，适合 CI/CD 环境
-
 ## 自动发现
 
 `auto_discovery: true` 时，每次启动自动扫描 `opencode.json`，从中提取 `apiKey`、`token`、`secret` 等敏感字段值，生成对应的正则规则追加到配置文件中。

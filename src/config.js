@@ -127,18 +127,6 @@ function validateSchema(raw) {
     }
   }
 
-  // profile
-  if (raw.profile !== undefined && typeof raw.profile !== "string") {
-    errors.push("profile must be a string")
-  }
-
-  // profiles
-  if (raw.profiles !== undefined) {
-    if (typeof raw.profiles !== "object") {
-      errors.push("profiles must be an object")
-    }
-  }
-
   return { valid: errors.length === 0, errors, config: raw }
 }
 
@@ -172,19 +160,7 @@ function normalizeConfig(raw) {
     ? Number(session.max_mappings)
     : 100000
 
-  // 解析 Profile
-  const activeProfileName = typeof cfg.profile === "string" && cfg.profile ? cfg.profile : ""
-  const profiles = cfg.profiles && typeof cfg.profiles === "object" ? cfg.profiles : {}
-  const basePatterns = cfg.patterns && typeof cfg.patterns === "object" ? cfg.patterns : {}
-
-  let patterns
-  if (activeProfileName && profiles[activeProfileName]) {
-    const profileCfg = profiles[activeProfileName]
-    const profilePats = profileCfg.patterns && typeof profileCfg.patterns === "object" ? profileCfg.patterns : {}
-    patterns = mergePatterns(basePatterns, profilePats)
-  } else {
-    patterns = basePatterns
-  }
+  const patterns = cfg.patterns && typeof cfg.patterns === "object" ? cfg.patterns : {}
 
   return {
     enabled,
@@ -194,34 +170,6 @@ function normalizeConfig(raw) {
     ttlMs,
     maxMappings,
     patterns,
-    profile: activeProfileName,
-    _allProfiles: Object.keys(profiles),
-  }
-}
-
-/**
- * 合并 base patterns 与 profile patterns。
- * 规则：keywords/regex 拼接去重，builtin/exclude profile 优先覆盖。
- * @param {object} base
- * @param {object} profile
- * @returns {object}
- */
-function mergePatterns(base, profile) {
-  return {
-    keywords: [
-      ...(Array.isArray(base.keywords) ? base.keywords : []),
-      ...(Array.isArray(profile.keywords) ? profile.keywords : []),
-    ],
-    regex: [
-      ...(Array.isArray(base.regex) ? base.regex : []),
-      ...(Array.isArray(profile.regex) ? profile.regex : []),
-    ],
-    builtin: profile.builtin !== undefined
-      ? (Array.isArray(profile.builtin) ? [...profile.builtin] : [])
-      : (Array.isArray(base.builtin) ? [...base.builtin] : []),
-    exclude: profile.exclude !== undefined
-      ? (Array.isArray(profile.exclude) ? [...profile.exclude] : [])
-      : (Array.isArray(base.exclude) ? [...base.exclude] : []),
   }
 }
 
@@ -234,8 +182,6 @@ function mergePatterns(base, profile) {
  * @property {number} ttlMs
  * @property {number} maxMappings
  * @property {object} patterns
- * @property {string} profile - 当前激活的 profile 名（空串表示未设置）
- * @property {string[]} _allProfiles - 所有可用 profile 名称
  * @property {string} [loadedFrom]
  */
 
@@ -284,13 +230,6 @@ auto_discovery: true
 
 # 脱敏后占位符前缀。完整格式：{PREFIX}_{CATEGORY}_{hash12}__
 placeholder_prefix: "__OMOS_"
-
-
-# ---------- 场景 Profile ----------
-
-# 激活的场景名（daily/code_review/ci_cd），不设置则使用 base patterns。
-# 详见下方 profiles 定义。
-# profile: "daily"
 
 
 # ---------- 会话管理 ----------
@@ -358,63 +297,6 @@ patterns:
     - "localhost"
     - "127.0.0.1"
     - "0.0.0.0"
-
-
-# ============================================
-# 场景 Profile
-# ============================================
-# 通过顶层 profile 字段选择激活。
-# Profile 的 patterns 与 base patterns 合并规则：
-#   keywords/regex — 拼接
-#   builtin/exclude — Profile 覆盖 base
-# ============================================
-
-profiles:
-
-  # --- 日常对话 ---
-  # 轻量脱敏，不影响正常聊天
-  daily:
-    description: "日常对话 - 轻量脱敏"
-    patterns:
-      builtin:
-        - email
-        - china_phone
-        - uuid
-      exclude:
-        - "example.com"
-        - "localhost"
-
-  # --- 代码审查 ---
-  # 全面脱敏，覆盖代码中可能出现的凭据
-  code_review:
-    description: "代码审查 - 全面脱敏"
-    patterns:
-      builtin:
-        - email
-        - china_phone
-        - china_id
-        - uuid
-        - jwt
-        - ipv4
-        - ipv6
-        - mac
-      regex:
-        - pattern: "(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]+"
-          placeholder-id: "GITHUB_TOKEN"
-
-  # --- CI/CD ---
-  # 着重保护密钥和令牌
-  ci_cd:
-    description: "CI/CD - 着重保护密钥和令牌"
-    patterns:
-      builtin:
-        - aws_key
-        - github_token
-        - openai_key
-        - email
-      regex:
-        - pattern: "AKIA[0-9A-Z]{16}"
-          placeholder-id: "AWS_ACCESS_KEY"
 `
 }
 
@@ -741,7 +623,7 @@ function generatePattern(value) {
   const prefix = m ? m[1] : v.slice(0, Math.min(4, v.length))
   const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
   const remainLen = v.length - prefix.length
-  return escaped + "[A-Za-z0-9_-]{" + remainLen + "}"
+  return escaped + "[A-Za-z0-9_-]{" + remainLen + "}(?![A-Za-z0-9_-])"
 }
 
 /**

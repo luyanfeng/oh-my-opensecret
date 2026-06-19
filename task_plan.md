@@ -70,17 +70,15 @@ Phase 7 (规划中)
   - `src/index.js` — 插件入口（3 个 hook 注册）
   - `test/integration.test.js` — 集成测试
 
-### Phase 5: 场景化配置 ✅ 已完成
+### Phase 5: 场景化配置 ⏳ 已移除
 
-- [x] 实现场景 Profile 机制（profile 选择 + patterns 合并：keywords/regex 拼接，builtin/exclude 覆盖）
-- [x] 编写各场景分析文档（daily-chat、code-review、ci-cd）
-- [x] 默认场景配置（默认 YAML 含 profiles 定义）
-- **Status:** complete
-- **产出:**
-  - `doc/scenarios/01-daily-chat.md` — 日常对话场景分析
-  - `doc/scenarios/02-code-review.md` — 代码审查场景分析
-  - `doc/scenarios/03-ci-cd.md` — CI/CD 场景分析
-  - `test/profile.test.js` — Profile 合并测试
+> Profile 功能因实用性有限（需 YAML 编辑 + 重启 Opencode 才能切换）已被移除。
+> 场景分析文档保留作为参考，不再有对应的实现代码。
+- **Status:** removed
+- **保留产出（仅文档参考）:**
+  - `doc/scenarios/01-daily-chat.md`
+  - `doc/scenarios/02-code-review.md`
+  - `doc/scenarios/03-ci-cd.md`
 
 ### Phase 6: 测试与交付 ✅ 已完成
 
@@ -109,7 +107,7 @@ Phase 7 (规划中)
 ```
 oh-my-opensecret/
 ├── package.json              # 包配置（入口、依赖、脚本）
-├── oh-my-opensecret.yaml.example  # 配置示例（含 profiles）
+├── oh-my-opensecret.yaml.example  # 配置示例
 ├── src/
 │   ├── index.js              # 插件入口（3 个 hook 注册）
 │   ├── config.js             # 配置加载（级联查找 + YAML 解析 + auto-discovery）
@@ -124,7 +122,7 @@ oh-my-opensecret/
 │   ├── session.test.js       # 会话管理单元测试
 │   ├── deep.test.js          # 深度工具单元测试
 │   ├── config.test.js        # 配置加载测试
-│   ├── profile.test.js       # Profile 合并测试
+
 │   ├── integration.test.js   # 集成测试
 │   └── acceptance.test.js    # 验收测试
 └── doc/
@@ -157,10 +155,10 @@ oh-my-opensecret/
 | 输出还原 | ✅ | `text.complete` hook：还原占位符为原文 |
 | 工具参数还原 | ✅ | `tool.execute.before` hook：深度还原工具入参 |
 | 深度遍历 | ✅ | 递归 Array/PlainObject，WeakSet 防循环引用 |
-| 场景 Profile | ✅ | daily/code_review/ci_cd 三种预置场景，支持自定义 |
+| 场景 Profile | ❌ 已移除 | 需 YAML 编辑+重启才能切换，实际用处不大 |
 | 分级日志 | ✅ | debug/info/warn/error，文件输出 + 滚动（按大小+日期） |
 | `enabled: false` 降级 | ✅ | 完全禁用，注册空 hook，no-op |
-| 7 个测试文件 | ✅ | engine/session/deep/config/profile/integration/acceptance |
+| 6 个测试文件 | ✅ | engine/session/deep/config/integration/acceptance |
 | **TUI Sidebar 面板** | ⏳ | 研究已完成，待实现 |
 
 ## Key Questions
