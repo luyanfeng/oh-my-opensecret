@@ -199,8 +199,15 @@ const OpenSecret = async (ctx) => {
       if (!output || typeof output !== "object") return
       if (typeof output.text !== "string" || !output.text) return
 
-      const session = getSession(input?.sessionID)
-      if (!session) return
+      const sid = input?.sessionID
+      const hasPlaceholder = output.text.includes("__OMOS_")
+      logger.debug(`text.complete: sessionID=${sid}, hasPlaceholder=${hasPlaceholder}`)
+
+      const session = getSession(sid)
+      if (!session) {
+        logger.debug(`text.complete: 跳过还原 — sessionID=${sid} 无对应 session`)
+        return
+      }
 
       session.cleanup()
       const before = output.text
@@ -208,6 +215,8 @@ const OpenSecret = async (ctx) => {
       if (after !== before) {
         output.text = after
         logger.debug("text.complete: 还原了 1 处占位符")
+      } else if (hasPlaceholder) {
+        logger.debug(`text.complete: 有占位符但未还原 — session.size=${session.size}`)
       }
     },
 
