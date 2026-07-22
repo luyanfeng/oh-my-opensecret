@@ -125,6 +125,30 @@ function parsePatternFlags(pattern) {
  * @param {object} raw 原始 patterns 配置
  * @returns {{ keywords: Array<{value:string,placeholderId:string}>, regex: Array<{pattern:string,placeholderId:string}>, exclude: Set<string> }}
  */
+/**
+ * 将简单的 glob 模式（仅支持 * 和 ?）转换为 RegExp。
+ * - `*` 匹配任意非空字符序列（类似 shell glob，不跨多行）
+ * - `?` 匹配单个非空字符
+ * - 其余字符按字面匹配（已转义）
+ *
+ * @param {string} glob
+ * @returns {RegExp}
+ */
+function globToRegex(glob) {
+  let src = ""
+  for (let i = 0; i < glob.length; i++) {
+    const ch = glob[i]
+    if (ch === "*") {
+      src += "[^\\r\\n]+"
+    } else if (ch === "?") {
+      src += "[^\\r\\n]"
+    } else {
+      src += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    }
+  }
+  return new RegExp("^" + src + "$")
+}
+
 export function buildPatternSet(raw) {
   const patterns = raw && typeof raw === "object" ? raw : {}
 
@@ -162,12 +186,23 @@ export function buildPatternSet(raw) {
     regexRules.push({ pattern: rule.pattern, placeholderId: rule.placeholderId })
   }
 
-  const excludeSet = new Set(exclude.map((x) => String(x ?? "")))
+  // exclude 支持精确字符串和 glob 模式（含 * 或 ?）
+  const exactSet = new Set()
+  const globRules = []
+  for (const x of exclude) {
+    const s = String(x ?? "")
+    if (!s) continue
+    if (/[*?]/.test(s)) {
+      globRules.push({ raw: s, re: globToRegex(s) })
+    } else {
+      exactSet.add(s)
+    }
+  }
 
   return {
     keywords: keywordRules,
     regex: regexRules,
-    exclude: excludeSet,
+    exclude: { exact: exactSet, glob: globRules },
   }
 }
 

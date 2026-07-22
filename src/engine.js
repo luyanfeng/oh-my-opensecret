@@ -99,6 +99,21 @@ function collectPlaceholderRanges(text, prefix) {
 }
 
 /**
+ * 检查原文是否命中 exclude 规则（精确字符串或 glob 模式）。
+ * @param {string} original
+ * @param {{ exact: Set<string>, glob: Array<{raw:string,re:RegExp}> }} exclude
+ * @returns {boolean}
+ */
+function isExcluded(original, exclude) {
+  if (exclude.exact.has(original)) return true
+  for (const g of exclude.glob) {
+    g.re.lastIndex = 0
+    if (g.re.test(original)) return true
+  }
+  return false
+}
+
+/**
  * 对输入文本进行脱敏替换。
  *
  * 策略：
@@ -108,7 +123,7 @@ function collectPlaceholderRanges(text, prefix) {
  * 4. 从右到左替换，避免 index 偏移
  *
  * @param {string} input 原始文本
- * @param {{ keywords: Array<{value:string,placeholderId:string}>, regex: Array<{pattern:string,placeholderId:string}>, exclude: Set<string> }} patterns
+ * @param {{ keywords: Array<{value:string,placeholderId:string}>, regex: Array<{pattern:string,placeholderId:string}>, exclude: { exact: Set<string>, glob: Array<{raw:string,re:RegExp}> } }} patterns
  * @param {{ getOrCreatePlaceholder(original: string, placeholderId: string): string }} session
  * @param {string} [placeholderPrefix] 占位符前缀，用于跳过已脱敏的值
  * @returns {{ text: string, matches: Array<{start:number,end:number,original:string,placeholderId:string,placeholder?:string}> }}
@@ -146,7 +161,7 @@ export function redactText(input, patterns, session, placeholderPrefix) {
       const end = pos + needle.length
       const original = text.slice(start, end)
       idx = end
-      if (patterns.exclude.has(original)) continue
+      if (isExcluded(original, patterns.exclude)) continue
       if (placeholderPrefix && isPlaceholderLike(original, placeholderPrefix)) continue
       if (isInSkipRange(start, end)) continue
       found.push({ start, end, original, placeholderId: rule.placeholderId })
@@ -170,7 +185,7 @@ export function redactText(input, patterns, session, placeholderPrefix) {
       if (start < 0) continue
       const end = start + m[0].length
       const original = text.slice(start, end)
-      if (patterns.exclude.has(original)) continue
+      if (isExcluded(original, patterns.exclude)) continue
       if (placeholderPrefix && isPlaceholderLike(original, placeholderPrefix)) continue
       if (isInSkipRange(start, end)) continue
       found.push({ start, end, original, placeholderId: rule.placeholderId })
