@@ -56,8 +56,8 @@ const BUILTIN = new Map([
   [
     "mac",
     {
-      description: "MAC 地址（xx:xx:xx:xx:xx:xx）",
-      pattern: String.raw`/(?:[0-9a-f]{2}:){5}[0-9a-f]{2}/i`,
+      description: "MAC 地址（xx:xx:xx:xx:xx:xx 或 xx-xx-xx-xx-xx-xx）",
+      pattern: String.raw`/(?:[0-9a-f]{2}:){5}[0-9a-f]{2}|(?:[0-9a-f]{2}-){5}[0-9a-f]{2}/i`,
       placeholderId: "MAC",
     },
   ],

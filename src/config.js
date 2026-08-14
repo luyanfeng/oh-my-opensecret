@@ -274,7 +274,7 @@ patterns:
   #   uuid            UUID v4 格式
   #   ipv4            IPv4 地址
   #   ipv6            IPv6 地址
-  #   mac             MAC 地址（xx:xx:xx:xx:xx:xx）
+  #   mac             MAC 地址（xx:xx:xx:xx:xx:xx 或 xx-xx-xx-xx-xx-xx）
   #   jwt             JWT Token（eyJxxx.eyJxxx.xxx）
   #   db_connection   数据库连接字符串（mysql://user:pass@host 等）
   #

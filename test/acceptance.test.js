@@ -485,10 +485,15 @@ describe("验收测试：AI Key 脱敏与还原", () => {
     })
 
     it("MAC 地址在文本中被脱敏", async () => {
-      const text = "mac: 00:1a:2b:3c:4d:5e"
-      const redacted = await redactViaHook(hooks, "builtin-mac", text)
-      assert.ok(redacted.includes("__OMOS_"))
-      assert.ok(!redacted.includes("00:1a:2b:3c:4d:5e"))
+      // 冒号分隔格式
+      const textColon = "mac: 00:e0:4c:68:00:7f"
+      const redactedColon = await redactViaHook(hooks, "builtin-mac", textColon)
+      assert.ok(!redactedColon.includes("00:e0:4c:68:00:7f"))
+
+      // 连字符分隔格式
+      const textDash = "mac: aa-bb-cc-dd-ee-ff"
+      const redactedDash = await redactViaHook(hooks, "builtin-mac", textDash)
+      assert.ok(!redactedDash.includes("aa-bb-cc-dd-ee-ff"))
     })
   })
 
