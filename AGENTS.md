@@ -32,7 +32,7 @@ V2 机制：`Plugin.define({ id, setup(ctx) })`，`setup` 内通过 `ctx.session
 | V1 Hook | V2 Hook | 作用 | 注意事项 |
 |---------|---------|------|----------|
 | `experimental.chat.messages.transform` | `ctx.session.hook("context")` | LLM 请求前脱敏 | in-place 修改 `event.messages[].content`；V2 无 sessionID，见下 |
-| `experimental.text.complete` | `ctx.session.hook("http.response")` | 响应完成后还原 | `event.response` 是 `Response`；只对 `application/json`/`text/*` 读流还原，其余透传 |
+| `experimental.text.complete` | （无对应，已移除） | ~~响应完成后还原~~ | V2 `http.response` 替换响应体后 server 不消费新 body，无法影响 TUI 展示；插件采用「脱敏单向、不还原」策略 |
 | `tool.execute.before` | `ctx.tool.hook("execute.before")` | 工具执行前还原参数 | 修改 `event.input`（深度遍历） |
 
 **关键 V2 差异（已确认官方行为）**：
@@ -107,7 +107,7 @@ node --test test/session.test.js     # 含 setTimeout，较慢
 
 ## 操作陷阱
 
-- **V2 修改 hook 时必须 in-place 操作 `event` 对象**：`context` 改 `event.messages[].content`；`http.response` 改 `event.response`（重建 `Response`）；`execute.before` 改 `event.input`
+- **V2 修改 hook 时必须 in-place 操作 `event` 对象**：`context` 改 `event.messages[].content`；`execute.before` 改 `event.input`
 - **进程级单例**：每个 location 各加载一份插件实例，但仅「最新注册者」经 `ProcessSingleton`（`src/singleton.js`）真正注册 hook，其余空转 —— 保证同一 server 进程只有一个本插件实现生效
 - `config.js` 中 YAML 的 `placeholder-id` 在 JS 对象中可能是 `placeholderId`（`config.js:645` 同时检查两者）
 - `deep.js` 使用 `WeakSet` 防循环引用（`restoreDeep` / `redactDeep` 各自独立）

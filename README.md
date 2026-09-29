@@ -7,9 +7,12 @@
 ## 功能
 
 - **发送前脱敏** — LLM 请求发出前，自动将消息中的敏感信息替换为占位符
-- **响应后还原** — LLM 返回的文本中，占位符自动还原为原文
 - **工具参数还原** — 工具执行前，参数中的占位符自动还原，本地工具拿到真实值
 - **闭环安全** — Provider 永远看不到明文，本地工具不受影响
+
+> ℹ️ **「脱敏单向」说明**：模型回复中若复述占位符，界面显示的仍是占位符形态（不会还原为原文）。
+> V2 的 `http.response` hook 替换响应体后 server 不消费新 body，无法影响界面展示，
+> 故本插件不注册该 hook。敏感信息本身绝不会泄露给 Provider，安全性不受影响。
 
 ## 工作原理
 
@@ -20,26 +23,24 @@
        │
        ▼
   ┌─ session.hook("context") ────────────────┐
-  │  脱敏: "user@example.com"                  │
-  │      → "__OMOS_EMAIL_xxx__"                │
+  │  脱敏: "user@example.com"                 │
+  │      → "__OMOS_EMAIL_xxx__"               │
   └────────────────────────────────────────────┘
        │
        ▼
   ┌─ 发送给 LLM ──────────────────────────────┐
   │  看到的是: "我的邮箱是 __OMOS_EMAIL_xxx__" │
+  │  Provider 无法获得真实邮箱                  │
   └────────────────────────────────────────────┘
        │
        ▼
-  ┌─ session.hook("http.response") ───────────┐
-  │  还原: "__OMOS_EMAIL_xxx__"                 │
-  │      → "user@example.com"                   │
+  ┌─ tool.hook("execute.before") ─────────────┐
+  │  还原: 工具参数中的占位符 → 真实值          │
+  │  本地工具正常使用原始数据                    │
   └────────────────────────────────────────────┘
-       │
-       ▼
-  用户看到原文
 ```
 
-工具参数在 `tool.hook("execute.before")` 阶段还原（本地工具拿到真实值）。
+模型回复中出现的占位符将保持占位符形态展示（脱敏单向）。
 
 ## 安装
 
@@ -100,7 +101,7 @@
 
 ```
 src/
-├── index.js      # 插件入口（V2 Plugin.define + 注册 context/http.response/execute.before hook）
+├── index.js      # 插件入口（V2 Plugin.define + 注册 context/execute.before hook）
 ├── singleton.js   # 进程级单例（globalThis 夺权，保证一个 server 进程只有一个实例生效）
 ├── config.js     # 配置加载（级联查找 + YAML 解析 + auto-discovery）
 ├── patterns.js   # 匹配规则构建（关键词/正则/内置/排除）
