@@ -107,7 +107,9 @@ export function redactEvent(event, session, patterns, logger) {
 }
 
 /**
- * 还原一段响应文本中的占位符。供 `http.response` 钩子使用，也可被单测直接调用。
+ * 还原一段文本中的占位符。纯函数，供单测直接调用与 `restore.js` 复用。
+ * 注：V2 的 `http.response` hook 已验证无法影响 TUI 展示（server 不消费替换后的 body），
+ * 当前插件采用「脱敏单向、不还原」策略，不再注册该 hook；本导出保留还原能力供后续方案使用。
  * @param {string} text
  * @param {{ lookup(ph: string): string | undefined, prefix: string }} session
  * @returns {string}
@@ -124,29 +126,6 @@ export function restoreResponseText(text, session) {
  */
 export function restoreInput(input, session) {
   restoreDeep(input, session)
-}
-
-/**
- * 判断 content-type 是否为可安全文本化还原的响应体。
- * 仅对 application/json 与 text/* 做占位符还原；其余（二进制/下载/原始流）原样透传，
- * 避免消费并破坏非文本响应体。
- * @param {string} contentType
- * @returns {boolean}
- */
-function isRestorableContentType(contentType) {
-  if (!contentType) return false
-  return /^(application\/(?:[\w.+-]*\+)?json|text\/)/i.test(contentType.trim())
-}
-
-/** 复制响应头，丢弃会因 body 改写而失效的 content-length / transfer-encoding。 */
-function cloneResponseHeaders(headers) {
-  const out = new Headers()
-  for (const [k, v] of headers) {
-    if (/^content-length$/i.test(k)) continue
-    if (/^transfer-encoding$/i.test(k)) continue
-    out.set(k, v)
-  }
-  return out
 }
 
 export default Plugin.define({
@@ -189,21 +168,6 @@ export default Plugin.define({
       redactEvent(event, session, patterns, logger)
     }
 
-    const makeResponseHandler = () => async (event) => {
-      if (!session) return
-      const contentType = event?.response?.headers?.get?.("content-type") ?? ""
-      if (!isRestorableContentType(contentType)) return
-      session.cleanup()
-      const original = await event.response.text()
-      const restored = restoreResponseText(original, session)
-      if (restored === original) return
-      event.response = new Response(restored, {
-        status: event.response.status,
-        statusText: event.response.statusText,
-        headers: cloneResponseHeaders(event.response.headers),
-      })
-    }
-
     const makeToolHandler = () => async (event) => {
       if (!session) return
       session.cleanup()
@@ -220,7 +184,6 @@ export default Plugin.define({
           maxMappings: config.maxMappings,
         })
         registrations.push(ctx.session.hook("context", makeContextHandler()))
-        registrations.push(ctx.session.hook("http.response", makeResponseHandler()))
         registrations.push(ctx.tool.hook("execute.before", makeToolHandler()))
       },
       deactivate: () => {
