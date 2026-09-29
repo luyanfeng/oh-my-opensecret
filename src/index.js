@@ -5,233 +5,236 @@ import { PlaceholderSession } from "./session.js"
 import { redactText } from "./engine.js"
 import { redactDeep, restoreDeep } from "./deep.js"
 import { restoreText } from "./restore.js"
+import { ProcessSingleton } from "./singleton.js"
 
 /**
- * oh-my-opensecret 插件入口。
+ * oh-my-opensecret 插件入口（OpenCode 2.x / V2 server plugin API）。
  *
- * Hook：
- * - `experimental.chat.messages.transform` — LLM 请求前脱敏
- * - `experimental.text.complete` — 响应完成后还原
- * - `tool.execute.before` — 工具执行前还原
+ * V2 机制：`Plugin.define({ id, setup(ctx) })`，`setup` 内通过
+ * `ctx.session.hook(name, cb)` / `ctx.tool.hook(name, cb)` 注册 hook，
+ * 并返回 cleanup 函数（可选）。
+ *
+ * Hook 映射（不再兼容 V1）：
+ * - V1 `experimental.chat.messages.transform` → V2 `session.hook("context")`   （请求前脱敏）
+ * - V1 `experimental.text.complete`          → V2 `session.hook("http.response")`（响应后还原）
+ * - V1 `tool.execute.before`                 → V2 `tool.hook("execute.before")` （工具参数还原）
+ *
+ * 进程级单例：每个 location 各加载一份插件实例，但仅有「最新注册者」实例真正注册
+ * hook（见 singleton.js），确保同一 server 进程只有一个本插件实现在生效。
  */
 
-/**
- * 提取命中位置的前后上下文，类似 grep -C。
- * @param {string} text 完整文本
- * @param {number} start 命中起始位置
- * @param {number} end 命中结束位置
- * @param {number} contextLen 上下文长度（字符数）
- * @returns {{ before: string, after: string }}
- */
-function contextAround(text, start, end, contextLen = 30) {
-  const ctx = Math.max(contextLen, 0)
-  const beforeStart = Math.max(0, start - ctx)
-  const afterEnd = Math.min(text.length, end + ctx)
-  let before = text.slice(beforeStart, start)
-  let after = text.slice(end, afterEnd)
-  // 如果截取的不是开头/结尾，加省略号
-  if (beforeStart > 0) before = "…" + before
-  if (afterEnd < text.length) after = after + "…"
-  // 换行符替换为可视标记，保持单行
-  before = before.replace(/\n/g, "\\n").replace(/\r/g, "\\r")
-  after = after.replace(/\n/g, "\\n").replace(/\r/g, "\\r")
-  return { before, after }
+// @opencode/plugin 由宿主（opencode server）在运行时提供。
+// 测试中若不可用，退化为最小 define 实现，使模块可独立导入与单测。
+/** @type {any} */
+let Plugin = { define: (definition) => definition }
+try {
+  const mod = await import("@opencode/plugin")
+  if (mod && mod.Plugin) Plugin = mod.Plugin
+} catch {
+  // 测试环境无宿主 SDK：保持降级 define，逻辑单测不依赖它。
 }
 
-const OpenSecret = async (ctx) => {
-  // 1. 加载配置（含自举 + 自动发现）
-  // 先以默认 File 模式创建 logger，加载完配置后再更新
-  const logger = createLogger({
-    level: "info",
-    filePath: "~/.oh-my-opensecret/oh-my-opensecret.log",
-    prefix: "[oh-my-opensecret]",
-    maxSize: "10m",
-    maxFiles: 7,
-  })
-  const config = await loadConfig(ctx.directory, logger)
-  logger.level = config.logging.level
-  logger.filePath = config.logging.file
-  logger.maxSize = config.logging.maxSize
-  logger.maxFiles = config.logging.maxFiles
-
-  logger.debug(
-    `配置加载: ${config.loadedFrom || "默认生成"} enabled=${config.enabled} autoDiscovery=${config.autoDiscovery}`,
-  )
-
-  if (!config.enabled) {
-    logger.info("插件已禁用（enabled=false），注册为空 hook")
-    return {}
-  }
-
-  // 2. 构建模式集
-  const patterns = buildPatternSet(config.patterns)
-
-  // 3. 会话管理器缓存（sessionID → PlaceholderSession）
-  /** @type {Map<string, PlaceholderSession>} */
-  const sessions = new Map()
-
-  const getSession = (sessionID) => {
-    const key = String(sessionID ?? "")
-    if (!key) return null
-    let session = sessions.get(key)
-    if (session) return session
-
-    session = new PlaceholderSession({
-      prefix: config.prefix,
-      ttlMs: config.ttlMs,
-      maxMappings: config.maxMappings,
-    })
-    sessions.set(key, session)
-    return session
-  }
-
-  return {
-    /**
-     * 消息列表转换：向 LLM 发送前脱敏所有消息中的敏感信息。
-     * 注意：必须 in-place 修改 output.messages，不可重新赋值。
-     */
-    "experimental.chat.messages.transform": async (_input, output) => {
-      const msgs = output?.messages
-      if (!Array.isArray(msgs) || msgs.length === 0) return
-
-      // 取第一个消息的 sessionID
-      const sessionID =
-        msgs[0]?.info?.sessionID ?? msgs[0]?.parts?.[0]?.sessionID
-      const session = getSession(sessionID)
-      if (!session) return
-
-      session.cleanup()
-      let changed = 0
-
-      for (const msg of msgs) {
-        const parts = Array.isArray(msg?.parts) ? msg.parts : []
-        for (const part of parts) {
-          if (!part) continue
-
-          // 普通文本
-          if (part.type === "text") {
-            if (part.ignored) continue
-            if (typeof part.text !== "string") continue
-            const before = part.text
-            const after = redactText(before, patterns, session).text
-            if (after !== before) changed++
-            part.text = after
-            continue
-          }
-
-          // 推理文本
-          if (part.type === "reasoning") {
-            if (typeof part.text !== "string") continue
-            const before = part.text
-            const after = redactText(before, patterns, session).text
-            if (after !== before) changed++
-            part.text = after
-            continue
-          }
-
-          // 工具调用/输出
-          if (part.type === "tool") {
-            const state = part.state
-            if (!state || typeof state !== "object") continue
-
-            // 工具输入深度脱敏
-            if (state.input && typeof state.input === "object") {
-              redactDeep(state.input, patterns, session)
-            }
-
-            if (state.status === "completed" && typeof state.output === "string") {
-              const result = redactText(state.output, patterns, session)
-              if (result.matches.length > 0) {
-                changed++
-                for (const m of result.matches) {
-                  const before = state.output
-                  // 用替换后的文本取上下文
-                  const after = result.text
-                  const phLen = m.placeholder.length
-                  const ctx = contextAround(after, m.start, m.start + phLen, 30)
-                  logger.debug(`脱敏 output: ...${ctx.before}[${m.placeholder}]${ctx.after}...`)
-                }
-              }
-              state.output = result.text
-              continue
-            }
-            if (state.status === "error" && typeof state.error === "string") {
-              const result = redactText(state.error, patterns, session, config.prefix)
-              if (result.matches.length > 0) {
-                changed++
-                for (const m of result.matches) {
-                  const after = result.text
-                  const phLen = m.placeholder.length
-                  const ctx = contextAround(after, m.start, m.start + phLen, 30)
-                  logger.debug(`脱敏 error: ...${ctx.before}[${m.placeholder}]${ctx.after}...`)
-                }
-              }
-              state.error = result.text
-              continue
-            }
-            if (state.status === "pending" && typeof state.raw === "string") {
-              const result = redactText(state.raw, patterns, session, config.prefix)
-              if (result.matches.length > 0) {
-                changed++
-                for (const m of result.matches) {
-                  const after = result.text
-                  const phLen = m.placeholder.length
-                  const ctx = contextAround(after, m.start, m.start + phLen, 30)
-                  logger.debug(`脱敏 raw: ...${ctx.before}[${m.placeholder}]${ctx.after}...`)
-                }
-              }
-              state.raw = result.text
-              continue
-            }
-          }
+/**
+ * 还原工具结果（tool-result）中的文本/JSON 内容。in-place 修改。
+ * @param {{ result?: { type: string, value?: unknown } }} part
+ * @param {{ keywords: Array<{value:string,placeholderId:string}>, regex: Array<{pattern:string,placeholderId:string}>, exclude: { exact: Set<string>, glob: Array<{raw:string,re:RegExp}> } }} patterns
+ * @param {{ getOrCreatePlaceholder(original: string, placeholderId: string): string }} session
+ */
+function redactToolResult(part, patterns, session) {
+  const result = part?.result
+  if (!result || typeof result !== "object") return
+  if (result.type === "text" || result.type === "error") {
+    if (typeof result.value === "string") {
+      result.value = redactText(result.value, patterns, session).text
+    }
+  } else if (result.type === "json") {
+    if (typeof result.value === "string") {
+      result.value = redactText(result.value, patterns, session).text
+    } else if (result.value && typeof result.value === "object") {
+      redactDeep(result.value, patterns, session)
+    }
+  } else if (result.type === "content") {
+    if (Array.isArray(result.value)) {
+      for (const c of result.value) {
+        if (c && c.type === "text" && typeof c.text === "string") {
+          c.text = redactText(c.text, patterns, session).text
         }
       }
-
-      if (changed > 0) {
-        logger.debug(`messages.transform: 脱敏了 ${changed} 处文本片段`)
-      }
-    },
-
-    /**
-     * 文本输出完成：将占位符还原为原文。
-     */
-    "experimental.text.complete": async (input, output) => {
-      if (!output || typeof output !== "object") return
-      if (typeof output.text !== "string" || !output.text) return
-
-      const sid = input?.sessionID
-      const hasPlaceholder = output.text.includes("__OMOS_")
-      logger.debug(`text.complete: sessionID=${sid}, hasPlaceholder=${hasPlaceholder}`)
-
-      const session = getSession(sid)
-      if (!session) {
-        logger.debug(`text.complete: 跳过还原 — sessionID=${sid} 无对应 session`)
-        return
-      }
-
-      session.cleanup()
-      const before = output.text
-      const after = restoreText(before, session)
-      if (after !== before) {
-        output.text = after
-        logger.debug("text.complete: 还原了 1 处占位符")
-      } else if (hasPlaceholder) {
-        logger.debug(`text.complete: 有占位符但未还原 — session.size=${session.size}`)
-      }
-    },
-
-    /**
-     * 工具执行前：将参数中的占位符还原为明文。
-     */
-    "tool.execute.before": async (input, output) => {
-      const session = getSession(input?.sessionID)
-      if (!session) return
-
-      session.cleanup()
-      restoreDeep(output?.args, session)
-    },
+    }
   }
 }
 
-export default OpenSecret
-export { OpenSecret }
+/**
+ * V2 消息脱敏（in-place）：遍历 `event.messages` 与 `event.system` 的所有文本/推理/
+ * 工具调用/工具结果 part。供 `session.hook("context")` 调用，也可被单测直接调用。
+ * @param {{ messages?: Array<any>, system?: Array<any> }} event
+ * @param {{ getOrCreatePlaceholder(original: string, placeholderId: string): string }} session
+ * @param {{ keywords: Array<{value:string,placeholderId:string}>, regex: Array<{pattern:string,placeholderId:string}>, exclude: { exact: Set<string>, glob: Array<{raw:string,re:RegExp}> } }} patterns
+ * @param {{ debug?: (msg: string) => void }} [logger]
+ */
+export function redactEvent(event, session, patterns, logger) {
+  const log = logger?.debug?.bind?.(logger) ?? (() => {})
+
+  const redactTextPart = (part) => {
+    if (!part) return
+    if (part.type === "text" || part.type === "reasoning") {
+      if (typeof part.text === "string") {
+        const before = part.text
+        part.text = redactText(before, patterns, session).text
+        if (part.text !== before) log(`脱敏 text: 已替换敏感片段`)
+      }
+    } else if (part.type === "tool-call") {
+      if (part.input && typeof part.input === "object") {
+        redactDeep(part.input, patterns, session)
+      }
+    } else if (part.type === "tool-result") {
+      redactToolResult(part, patterns, session)
+    }
+  }
+
+  // system 指令（可能含从配置注入的密钥）
+  if (Array.isArray(event?.system)) {
+    for (const part of event.system) redactTextPart(part)
+  }
+
+  const msgs = event?.messages
+  if (!Array.isArray(msgs) || msgs.length === 0) return
+
+  for (const msg of msgs) {
+    if (!msg || !Array.isArray(msg.content)) continue
+    for (const part of msg.content) redactTextPart(part)
+  }
+}
+
+/**
+ * 还原一段响应文本中的占位符。供 `http.response` 钩子使用，也可被单测直接调用。
+ * @param {string} text
+ * @param {{ lookup(ph: string): string | undefined, prefix: string }} session
+ * @returns {string}
+ */
+export function restoreResponseText(text, session) {
+  return restoreText(String(text ?? ""), session)
+}
+
+/**
+ * 工具参数还原（in-place）：深度还原 `input` 中的占位符。
+ * 供 `tool.hook("execute.before")` 调用，也可被单测直接调用。
+ * @param {unknown} input
+ * @param {{ lookup(ph: string): string | undefined, prefix: string }} session
+ */
+export function restoreInput(input, session) {
+  restoreDeep(input, session)
+}
+
+/**
+ * 判断 content-type 是否为可安全文本化还原的响应体。
+ * 仅对 application/json 与 text/* 做占位符还原；其余（二进制/下载/原始流）原样透传，
+ * 避免消费并破坏非文本响应体。
+ * @param {string} contentType
+ * @returns {boolean}
+ */
+function isRestorableContentType(contentType) {
+  if (!contentType) return false
+  return /^(application\/(?:[\w.+-]*\+)?json|text\/)/i.test(contentType.trim())
+}
+
+/** 复制响应头，丢弃会因 body 改写而失效的 content-length / transfer-encoding。 */
+function cloneResponseHeaders(headers) {
+  const out = new Headers()
+  for (const [k, v] of headers) {
+    if (/^content-length$/i.test(k)) continue
+    if (/^transfer-encoding$/i.test(k)) continue
+    out.set(k, v)
+  }
+  return out
+}
+
+export default Plugin.define({
+  id: "oh-my-opensecret",
+  async setup(ctx) {
+    // 1. 加载配置（含自举 + 自动发现）。目录用 V2 的 location.directory。
+    const directory = String(ctx?.location?.directory ?? process.cwd())
+    const logger = createLogger({
+      level: "info",
+      filePath: "~/.oh-my-opensecret/oh-my-opensecret.log",
+      prefix: "[oh-my-opensecret]",
+      maxSize: "10m",
+      maxFiles: 7,
+    })
+    const config = await loadConfig(directory, logger)
+    logger.level = config.logging.level
+    logger.filePath = config.logging.file
+    logger.maxSize = config.logging.maxSize
+    logger.maxFiles = config.logging.maxFiles
+
+    if (!config.enabled) {
+      logger.info("插件已禁用（enabled=false），不注册 hook")
+      return
+    }
+
+    // 2. 构建模式集
+    const patterns = buildPatternSet(config.patterns)
+
+    // 3. 进程级共享占位符会话（active 实例持有，密钥进程内唯一）。
+    //    注意：V2 的 context hook 不带 sessionID，无法区分会话，
+    //    故整个 server 进程共用一把 HMAC 密钥与一张映射表（密钥不出本机）。
+    /** @type {PlaceholderSession | null} */
+    let session = null
+    /** @type {Array<{ dispose(): void }>} */
+    let registrations = []
+
+    const makeContextHandler = () => async (event) => {
+      if (!session) return
+      session.cleanup()
+      redactEvent(event, session, patterns, logger)
+    }
+
+    const makeResponseHandler = () => async (event) => {
+      if (!session) return
+      const contentType = event?.response?.headers?.get?.("content-type") ?? ""
+      if (!isRestorableContentType(contentType)) return
+      session.cleanup()
+      const original = await event.response.text()
+      const restored = restoreResponseText(original, session)
+      if (restored === original) return
+      event.response = new Response(restored, {
+        status: event.response.status,
+        statusText: event.response.statusText,
+        headers: cloneResponseHeaders(event.response.headers),
+      })
+    }
+
+    const makeToolHandler = () => async (event) => {
+      if (!session) return
+      session.cleanup()
+      restoreInput(event?.input, session)
+    }
+
+    // 4. 进程级单例：仅 active 实例注册 hook。
+    const singleton = new ProcessSingleton({
+      id: directory,
+      activate: () => {
+        session = new PlaceholderSession({
+          prefix: config.prefix,
+          ttlMs: config.ttlMs,
+          maxMappings: config.maxMappings,
+        })
+        registrations.push(ctx.session.hook("context", makeContextHandler()))
+        registrations.push(ctx.session.hook("http.response", makeResponseHandler()))
+        registrations.push(ctx.tool.hook("execute.before", makeToolHandler()))
+      },
+      deactivate: () => {
+        for (const r of registrations) {
+          try { r.dispose() } catch { /* 忽略已释放的 registration */ }
+        }
+        registrations = []
+        session = null
+      },
+    })
+
+    // 5. cleanup：释放单例槽位（可能把 owner 交给仍存活的最新实例）。
+    return () => {
+      singleton.release()
+    }
+  },
+})

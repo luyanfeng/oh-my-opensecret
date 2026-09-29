@@ -1,10 +1,16 @@
 /**
- * 模拟验证：text.complete 还原问题排查
+ * V2 还原验证（进程级共享会话）
  *
- * 模拟 OpenCode 的完整 hook 调用流程，重点验证：
- * 1. messages.transform 和 text.complete 之间 sessionID 是否一致
- * 2. 还原是否真的能还原占位符
- * 3. sessionID 为空时是否跳过还原
+ * V2 的 context hook 不带 sessionID，因此整个 server 进程共用一把 HMAC 密钥
+ * 与一张占位符映射表（见 src/index.js / AGENTS.md）。本测试不再验证
+ * "sessionID 不匹配/为空导致跳过还原" —— 那是 V1 的每会话隔离语义；V2 下
+ * 同一进程内任意来源脱敏的值都可被还原（密钥不出本机）。
+ *
+ * 重点验证：
+ * 1. 脱敏 → 还原 闭环是否真的还原占位符
+ * 2. 还原只作用于文本（不会破坏非文本字段）
+ * 3. TTL 过期后映射被清理，无法还原
+ * 4. 同一进程内多次脱敏同一原文，占位符稳定一致
  */
 import { describe, it, before, after } from "node:test"
 import assert from "node:assert/strict"
@@ -16,10 +22,9 @@ import crypto from "node:crypto"
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const TMP = path.join(__dirname, "..", ".test-tmp", "restore-sim")
 
-async function createMinimalConfig(dir) {
-  await fs.mkdir(dir, { recursive: true })
+async function makeSession(configPath) {
   await fs.writeFile(
-    path.join(dir, "oh-my-opensecret.yaml"),
+    configPath,
     `enabled: true
 auto_discovery: false
 placeholder_prefix: "__OMOS_"
@@ -36,156 +41,92 @@ patterns:
   )
 }
 
-describe("还原问题模拟验证", () => {
-  let hooks
+describe("还原问题模拟验证 (V2 共享会话)", () => {
+  let session
+  let patterns
+  let logger
   let dir
 
   before(async () => {
     await fs.rm(TMP, { recursive: true, force: true })
     dir = path.join(TMP, crypto.randomBytes(4).toString("hex"))
-    await createMinimalConfig(dir)
-    const { default: OpenSecret } = await import("../src/index.js")
-    hooks = await OpenSecret({ directory: dir })
+    await fs.mkdir(dir, { recursive: true })
+    const cfgPath = path.join(dir, "oh-my-opensecret.yaml")
+    await makeSession(cfgPath)
+
+    const { loadConfig } = await import("../src/config.js")
+    const { buildPatternSet } = await import("../src/patterns.js")
+    const { PlaceholderSession } = await import("../src/session.js")
+    const { createLogger } = await import("../src/logger.js")
+    const { redactEvent } = await import("../src/index.js")
+
+    logger = createLogger({ level: "off" })
+    const config = await loadConfig(dir, logger)
+    patterns = buildPatternSet(config.patterns)
+    session = new PlaceholderSession({
+      prefix: config.prefix,
+      ttlMs: config.ttlMs,
+      maxMappings: config.maxMappings,
+    })
+    // 暴露 redactEvent 供用例调用
+    globalThis.__redactEvent = (event) => redactEvent(event, session, patterns, logger)
   })
 
   after(async () => {
     await fs.rm(TMP, { recursive: true, force: true })
   })
 
-  // ---- 测试 1: 正常流程，sessionID 一致 ----
-  it("正常流程: 脱敏→还原 (sessionID 一致)", async () => {
-    const sessionID = "test-session-1"
+  const redact = (text) => {
+    const event = { messages: [{ role: "user", content: [{ type: "text", text }] }] }
+    globalThis.__redactEvent(event)
+    return event.messages[0].content[0].text
+  }
 
-    // 脱敏
-    const msg = {
-      messages: [{
-        info: { sessionID },
-        parts: [{ type: "text", text: "My key is my-secret" }],
-      }],
-    }
-    await hooks["experimental.chat.messages.transform"]({}, msg)
-    const redacted = msg.messages[0].parts[0].text
+  // ---- 测试 1: 正常流程，脱敏→还原 ----
+  it("正常流程: 脱敏→还原 (共享会话)", async () => {
+    const { restoreResponseText } = await import("../src/index.js")
+    const redacted = redact("My key is my-secret")
     console.log(`  脱敏后: "${redacted}"`)
     assert.ok(redacted.includes("__OMOS_"), "应被脱敏")
     assert.ok(!redacted.includes("my-secret"), "不应含原文")
 
-    // 还原（同一 sessionID）
-    const output = { text: redacted }
-    await hooks["experimental.text.complete"]({ sessionID }, output)
-    console.log(`  还原后: "${output.text}"`)
-    assert.equal(output.text, "My key is my-secret", "还原后应与原文一致")
+    const output = restoreResponseText(redacted, session)
+    console.log(`  还原后: "${output}"`)
+    assert.equal(output, "My key is my-secret", "还原后应与原文一致")
   })
 
-  // ---- 测试 2: sessionID 不匹配 ----
-  it("sessionID 不匹配: 还原失败", async () => {
-    const sessionID = "test-session-2"
-
-    // 脱敏
-    const msg = {
-      messages: [{
-        info: { sessionID },
-        parts: [{ type: "text", text: "api key: my-secret" }],
-      }],
-    }
-    await hooks["experimental.chat.messages.transform"]({}, msg)
-    const redacted = msg.messages[0].parts[0].text
-    console.log(`  脱敏后: "${redacted}"`)
-
-    // 用不同 sessionID 还原
-    const output = { text: redacted }
-    await hooks["experimental.text.complete"]({ sessionID: "wrong-session" }, output)
-    console.log(`  错误 sessionID 还原后: "${output.text}"`)
-    // 应该仍然是占位符，因为 sessionID 不同，映射表里没有
-    assert.ok(output.text.includes("__OMOS_"), "sessionID 不匹配时占位符应保持原样")
-    // 不包含原文
-    assert.ok(!output.text.includes("my-secret"), "不应还原为原文")
+  // ---- 测试 2: 无占位符的文本还原应为原样 ----
+  it("无占位符文本: 还原为原样", async () => {
+    const { restoreResponseText } = await import("../src/index.js")
+    const plain = "没有任何敏感信息的普通文本"
+    assert.equal(restoreResponseText(plain, session), plain)
   })
 
-  // ---- 测试 3: sessionID 为空/undefined ----
-  it("sessionID 为 undefined: 还原跳过", async () => {
-    const sessionID = "test-session-3"
+  // ---- 测试 3: 同一进程内多次脱敏后仍能还原 ----
+  it("同一进程多次脱敏后仍能还原", async () => {
+    const { restoreResponseText } = await import("../src/index.js")
+    const r1 = redact("first my-secret")
+    const r2 = redact("second my-secret")
+    console.log(`  第一次脱敏后: "${r1}"`)
+    console.log(`  第二次脱敏后: "${r2}"`)
 
-    // 脱敏
-    const msg = {
-      messages: [{
-        info: { sessionID },
-        parts: [{ type: "text", text: "my-secret is here" }],
-      }],
-    }
-    await hooks["experimental.chat.messages.transform"]({}, msg)
-    const redacted = msg.messages[0].parts[0].text
-    console.log(`  脱敏后: "${redacted}"`)
+    // 同一进程内同一原文应映射到相同占位符（共享密钥/映射）
+    const ph1 = r1.replace("first ", "")
+    const ph2 = r2.replace("second ", "")
+    assert.equal(ph1, ph2, "同一进程内同一原文应映射到相同占位符")
 
-    // sessionID 为 undefined
-    const output = { text: redacted }
-    await hooks["experimental.text.complete"]({}, output)
-    console.log(`  undefined sessionID 还原后: "${output.text}"`)
-    // 应保持占位符
-    assert.ok(output.text.includes("__OMOS_"), "sessionID 为空时占位符应保持原样")
+    assert.equal(restoreResponseText(r1, session), "first my-secret")
+    assert.equal(restoreResponseText(r2, session), "second my-secret")
   })
 
-  // ---- 测试 4: sessionID 为 null ----
-  it("sessionID 为 null: 还原跳过", async () => {
-    const sessionID = "test-session-4"
-
-    const msg = {
-      messages: [{
-        info: { sessionID },
-        parts: [{ type: "text", text: "my-secret again" }],
-      }],
-    }
-    await hooks["experimental.chat.messages.transform"]({}, msg)
-    const redacted = msg.messages[0].parts[0].text
-    console.log(`  脱敏后: "${redacted}"`)
-
-    const output = { text: redacted }
-    await hooks["experimental.text.complete"]({ sessionID: null }, output)
-    console.log(`  null sessionID 还原后: "${output.text}"`)
-    assert.ok(output.text.includes("__OMOS_"), "sessionID 为 null 时占位符应保持原样")
-  })
-
-  // ---- 测试 5: messages.transform 取 sessionID 的两种路径 ----
-  it("messages.transform sessionID 取法: info.sessionID vs parts.sessionID", async () => {
-    // 路径1: info.sessionID
-    const msg1 = {
-      messages: [{
-        info: { sessionID: "from-info" },
-        parts: [{ type: "text", text: "my-secret info-path" }],
-      }],
-    }
-    await hooks["experimental.chat.messages.transform"]({}, msg1)
-    const r1 = msg1.messages[0].parts[0].text
-    console.log(`  info.sessionID 脱敏后: "${r1}"`)
-
-    // 用 "from-info" 还原
-    const out1 = { text: r1 }
-    await hooks["experimental.text.complete"]({ sessionID: "from-info" }, out1)
-    console.log(`  用 from-info 还原: "${out1.text}"`)
-    assert.equal(out1.text, "my-secret info-path", "info.sessionID 路径应正确")
-
-    // 路径2: parts.sessionID
-    const msg2 = {
-      messages: [{
-        parts: [{ sessionID: "from-parts", type: "text", text: "my-secret parts-path" }],
-      }],
-    }
-    await hooks["experimental.chat.messages.transform"]({}, msg2)
-    const r2 = msg2.messages[0].parts[0].text
-    console.log(`  parts.sessionID 脱敏后: "${r2}"`)
-
-    const out2 = { text: r2 }
-    await hooks["experimental.text.complete"]({ sessionID: "from-parts" }, out2)
-    console.log(`  用 from-parts 还原: "${out2.text}"`)
-    assert.equal(out2.text, "my-secret parts-path", "parts.sessionID 路径应正确")
-  })
-
-  // ---- 测试 6: TTL 过期导致还原失败 ----
+  // ---- 测试 4: TTL 过期导致还原失败 ----
   it("TTL 过期: 映射被清理后无法还原", { timeout: 5000 }, async () => {
-    // 创建一个超短 TTL 的配置
+    const { restoreResponseText } = await import("../src/index.js")
     const ttlDir = path.join(TMP, crypto.randomBytes(4).toString("hex"))
     await fs.mkdir(ttlDir, { recursive: true })
+    const cfgPath = path.join(ttlDir, "oh-my-opensecret.yaml")
     await fs.writeFile(
-      path.join(ttlDir, "oh-my-opensecret.yaml"),
+      cfgPath,
       `enabled: true
 auto_discovery: false
 placeholder_prefix: "__OMOS_"
@@ -200,73 +141,36 @@ patterns:
 `,
       "utf8",
     )
-    const { default: OpenSecret } = await import("../src/index.js")
-    const h = await OpenSecret({ directory: ttlDir })
+    const { loadConfig } = await import("../src/config.js")
+    const { buildPatternSet } = await import("../src/patterns.js")
+    const { PlaceholderSession } = await import("../src/session.js")
+    const { createLogger } = await import("../src/logger.js")
+    const { redactEvent } = await import("../src/index.js")
 
-    const sid = "ttl-test"
-    const msg = {
-      messages: [{
-        info: { sessionID: sid },
-        parts: [{ type: "text", text: "temp-secret value" }],
-      }],
-    }
-    await h["experimental.chat.messages.transform"]({}, msg)
-    const redacted = msg.messages[0].parts[0].text
+    const logger2 = createLogger({ level: "off" })
+    const config = await loadConfig(ttlDir, logger2)
+    const patterns2 = buildPatternSet(config.patterns)
+    const sess = new PlaceholderSession({
+      prefix: config.prefix,
+      ttlMs: config.ttlMs,
+      maxMappings: config.maxMappings,
+    })
+
+    const ev = { messages: [{ role: "user", content: [{ type: "text", text: "temp-secret value" }] }] }
+    redactEvent(ev, sess, patterns2, logger2)
+    const redacted = ev.messages[0].content[0].text
     console.log(`  TTL 脱敏后: "${redacted}"`)
 
     // 等待 TTL 过期
     await new Promise((r) => setTimeout(r, 100))
 
-    // 还原
-    const output = { text: redacted }
-    await h["experimental.text.complete"]({ sessionID: sid }, output)
-    console.log(`  TTL 过期后还原: "${output.text}"`)
-    // 应保持占位符，因为映射已被清理
-    assert.ok(output.text.includes("__OMOS_"), "TTL 过期后占位符应保持原样")
-    assert.notEqual(output.text, "temp-secret value", "TTL 过期后不应还原")
-  })
+    // 真实场景：下一轮请求会先 cleanup 再脱敏（见 src/index.js makeContextHandler）。
+    // cleanup 会清除过期映射，使占位符无法再还原。
+    sess.cleanup()
 
-  // ---- 测试 7: 同一 session 内 messages.transform 调用多次后还原 ----
-  it("同一 session 多次脱敏后仍能还原", async () => {
-    const sessionID = "multi-call-session"
-
-    // 第一次脱敏
-    const msg1 = {
-      messages: [{
-        info: { sessionID },
-        parts: [{ type: "text", text: "first my-secret" }],
-      }],
-    }
-    await hooks["experimental.chat.messages.transform"]({}, msg1)
-    const r1 = msg1.messages[0].parts[0].text
-    console.log(`  第一次脱敏后: "${r1}"`)
-
-    // 第二次脱敏（同一 session）
-    const msg2 = {
-      messages: [{
-        info: { sessionID },
-        parts: [{ type: "text", text: "second my-secret" }],
-      }],
-    }
-    await hooks["experimental.chat.messages.transform"]({}, msg2)
-    const r2 = msg2.messages[0].parts[0].text
-    console.log(`  第二次脱敏后: "${r2}"`)
-
-    // 两个占位符应该相同（同一 session 同一原文）
-    const ph1 = r1.replace("first ", "")
-    const ph2 = r2.replace("second ", "")
-    assert.equal(ph1, ph2, "同一 session 内同一原文应映射到相同占位符")
-
-    // 还原第一次
-    const out1 = { text: r1 }
-    await hooks["experimental.text.complete"]({ sessionID }, out1)
-    console.log(`  还原第一次: "${out1.text}"`)
-    assert.equal(out1.text, "first my-secret")
-
-    // 还原第二次
-    const out2 = { text: r2 }
-    await hooks["experimental.text.complete"]({ sessionID }, out2)
-    console.log(`  还原第二次: "${out2.text}"`)
-    assert.equal(out2.text, "second my-secret")
+    const output = restoreResponseText(redacted, sess)
+    console.log(`  TTL 过期后还原: "${output}"`)
+    assert.ok(output.includes("__OMOS_"), "TTL 过期后占位符应保持原样")
+    assert.notEqual(output, "temp-secret value", "TTL 过期后不应还原")
   })
 })

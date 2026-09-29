@@ -2,6 +2,8 @@
 
 **OpenCode 隐私脱敏插件** — 自动识别并替换敏感信息，保证 LLM 提供商看不见明文，同时本机工具执行不受影响。
 
+> ⚠️ **要求 OpenCode 2.x（V2 运行时）**。从 `0.2.0` 起不再兼容 OpenCode 1.x 的 V1 插件 API。
+
 ## 功能
 
 - **发送前脱敏** — LLM 请求发出前，自动将消息中的敏感信息替换为占位符
@@ -11,13 +13,15 @@
 
 ## 工作原理
 
+> 本插件基于 **OpenCode 2.x (V2) server 插件 API** 实现，不兼容 V1。
+
 ```
 用户输入 "我的邮箱是 user@example.com"
        │
        ▼
-  ┌─ messages.transform hook ─────────────────┐
+  ┌─ session.hook("context") ────────────────┐
   │  脱敏: "user@example.com"                  │
-  │      → "user@example.com"       │
+  │      → "__OMOS_EMAIL_xxx__"                │
   └────────────────────────────────────────────┘
        │
        ▼
@@ -26,32 +30,34 @@
   └────────────────────────────────────────────┘
        │
        ▼
-  ┌─ text.complete hook ──────────────────────┐
-  │  还原: "user@example.com"       │
-  │      → "user@example.com"                  │
+  ┌─ session.hook("http.response") ───────────┐
+  │  还原: "__OMOS_EMAIL_xxx__"                 │
+  │      → "user@example.com"                   │
   └────────────────────────────────────────────┘
        │
        ▼
   用户看到原文
 ```
 
+工具参数在 `tool.hook("execute.before")` 阶段还原（本地工具拿到真实值）。
+
 ## 安装
 
 ### 1. 安装插件
 
-在 `opencode.json` 的 `plugin` 数组中添加：
+本插件需要 OpenCode 2.x（V2 运行时）。在 `opencode.json` / `opencode.jsonc` 的 `plugins` 数组中添加：
 
-```json
+```jsonc
 {
-  "plugin": ["oh-my-opensecret"]
+  "plugins": ["oh-my-opensecret"]
 }
 ```
 
-或者指向本地源码（开发调试用）：
+或者指向本地源码（开发调试用，V2 支持直接加载 `.js` 入口）：
 
-```json
+```jsonc
 {
-  "plugin": ["file:///path/to/oh-my-opensecret/src/index.js"]
+  "plugins": ["./path/to/oh-my-opensecret/src/index.js"]
 }
 ```
 
@@ -94,11 +100,12 @@
 
 ```
 src/
-├── index.js      # 插件入口，注册 hook
+├── index.js      # 插件入口（V2 Plugin.define + 注册 context/http.response/execute.before hook）
+├── singleton.js   # 进程级单例（globalThis 夺权，保证一个 server 进程只有一个实例生效）
 ├── config.js     # 配置加载（级联查找 + YAML 解析 + auto-discovery）
 ├── patterns.js   # 匹配规则构建（关键词/正则/内置/排除）
 ├── engine.js     # 脱敏引擎（重叠命中处理）
-├── session.js    # 会话占位符管理器（HMAC 映射、TTL 淘汰）
+├── session.js    # 占位符管理器（进程级共享 HMAC 密钥 + 映射表 + TTL 淘汰）
 ├── restore.js    # 占位符还原
 ├── deep.js       # 深度遍历工具（递归脱敏/还原）
 └── logger.js     # 分级日志系统

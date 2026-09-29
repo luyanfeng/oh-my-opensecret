@@ -4,9 +4,9 @@ OpenCode 隐私脱敏插件。在 LLM 请求发送前脱敏敏感信息，响应
 
 ## 项目概要
 
-- **入口**: `src/index.js` — 默认导出 `OpenSecret(ctx)` 函数，返回 hook 对象
+- **入口**: `src/index.js` — V2 `Plugin.define({ id, setup(ctx) })` 导出，注册 hook 并导出纯处理函数
 - **类型**: ESM (`"type": "module"`)
-- **依赖**: 仅 `js-yaml`（配置解析）
+- **依赖**: `js-yaml`（配置解析）；`@opencode/plugin` 为 peerDependency（由 opencode server 运行时提供）
 - **测试**: `node:test`（Node 内置），无第三方测试库
 - **出口文件**: `package.json` `"files"` 含 `src/` 和 `oh-my-opensecret.yaml.example`
 
@@ -14,7 +14,8 @@ OpenCode 隐私脱敏插件。在 LLM 请求发送前脱敏敏感信息，响应
 
 ```
 src/
-├── index.js      # 插件入口，注册 3 个 hook
+├── index.js      # 插件入口（V2 Plugin.define + hook 注册 + 纯处理函数导出）
+├── singleton.js   # 进程级单例协调（globalThis 夺权，确保一个 server 进程只有一个实例注册 hook）
 ├── config.js     # 配置加载（级联查找 + YAML + auto-discovery）
 ├── patterns.js   # 匹配规则构建（关键词/正则/内置/排除）+ BUILTIN 规则表
 ├── engine.js     # 脱敏引擎（重叠命中处理）
@@ -24,13 +25,20 @@ src/
 └── logger.js     # 分级日志系统（文件输出、大小/日期滚动）
 ```
 
-## Hook 注册（`src/index.js:88-233`）
+## Hook 注册（`src/index.js`）
 
-| Hook | 作用 | 注意事项 |
-|------|------|----------|
-| `experimental.chat.messages.transform` | LLM 请求前脱敏 | **必须 in-place 修改 `output.messages`**，不可重新赋值 |
-| `experimental.text.complete` | 响应完成后还原 | 修改 `output.text`；sessionID 不匹配/空/过期 → 不还原 |
-| `tool.execute.before` | 工具执行前还原参数 | 修改 `output.args`（深度遍历） |
+V2 机制：`Plugin.define({ id, setup(ctx) })`，`setup` 内通过 `ctx.session.hook(name, cb)` / `ctx.tool.hook(name, cb)` 注册 hook，返回 cleanup 函数。
+
+| V1 Hook | V2 Hook | 作用 | 注意事项 |
+|---------|---------|------|----------|
+| `experimental.chat.messages.transform` | `ctx.session.hook("context")` | LLM 请求前脱敏 | in-place 修改 `event.messages[].content`；V2 无 sessionID，见下 |
+| `experimental.text.complete` | `ctx.session.hook("http.response")` | 响应完成后还原 | `event.response` 是 `Response`；只对 `application/json`/`text/*` 读流还原，其余透传 |
+| `tool.execute.before` | `ctx.tool.hook("execute.before")` | 工具执行前还原参数 | 修改 `event.input`（深度遍历） |
+
+**关键 V2 差异（已确认官方行为）**：
+- V2 `context` hook 事件**不带 `sessionID`**，因此整个 server 进程共用一把 HMAC 密钥与一张占位符映射表（密钥不出本机）。`src/index.js` 的 `makeContextHandler` 在脱敏前显式调用 `session.cleanup()`。
+- `Message` 结构：`msg.content[]` 取代 V1 的 `msg.parts[]`；part 类型为 `text`/`reasoning`/`tool-call`/`tool-result`（取代 V1 的 `tool` state 对象）。
+- `enabled=false` 时不注册任何 hook（返回 undefined）。
 
 ## 配置加载优先级（`src/config.js:310-325`）
 
@@ -64,9 +72,8 @@ node --test test/session.test.js     # 含 setTimeout，较慢
 {PREFIX}_{CATEGORY}_{hash12}__   例: __OMOS_OPENAI_KEY_ab12cd34ef56__
 ```
 
-- `hash12` = HMAC-SHA256(会话随机 secret, 原文) 前 12 位 hex
-- 同一 session 内同一原文 → 同一占位符（稳定可逆）
-- 不同 session 使用不同随机 secret，占位符不同
+- `hash12` = HMAC-SHA256(进程级共享 secret, 原文) 前 12 位 hex
+- **V2 无 sessionID**：整个 server 进程共用一把随机 secret 与一张映射表，故同进程内同一原文 → 同一占位符（稳定可逆）
 - 极低概率 hash 冲突时追加 `_N` 后缀
 
 ### 脱敏引擎重叠处理（`engine.js`）
@@ -100,11 +107,12 @@ node --test test/session.test.js     # 含 setTimeout，较慢
 
 ## 操作陷阱
 
-- **修改 hook 时必须 in-place 操作 `output` 对象**，不能重新赋值
+- **V2 修改 hook 时必须 in-place 操作 `event` 对象**：`context` 改 `event.messages[].content`；`http.response` 改 `event.response`（重建 `Response`）；`execute.before` 改 `event.input`
+- **进程级单例**：每个 location 各加载一份插件实例，但仅「最新注册者」经 `ProcessSingleton`（`src/singleton.js`）真正注册 hook，其余空转 —— 保证同一 server 进程只有一个本插件实现生效
 - `config.js` 中 YAML 的 `placeholder-id` 在 JS 对象中可能是 `placeholderId`（`config.js:645` 同时检查两者）
 - `deep.js` 使用 `WeakSet` 防循环引用（`restoreDeep` / `redactDeep` 各自独立）
 - `logger.js` 中 `flush()` 方法重复定义（第 108 和 120 行），第二个覆盖第一个 — 调试时异步写入可能未完成
-- `engine.js` 中 `redactText` 接受可选的 `placeholderPrefix` 参数用于跳过已脱敏值 — 只在 `messages.transform` hook 中传入
+- `engine.js` 中 `redactText` 接受可选的 `placeholderPrefix` 参数用于跳过已脱敏值（V2 暂时未传入，因为全局共享密钥下无需跳过）
 - 测试用临时目录在 `after` 钩子中递归删除，调试时可注释
-- sessionID 通过 `msg.info.sessionID` 或 `msg.parts[0].sessionID` 获取（`index.js:98-99`），后者是 OpenCode 1.17.11+ 的路径
-- sessionID 为空/undefined/null 时，`messages.transform` 跳过处理
+- V2 不再按 sessionID 隔离；同进程内任一来源脱敏的值都可被还原（密钥不出本机）
+- 本地单测直接导入 `src/index.js` 导出的 `redactEvent` / `restoreResponseText` / `restoreInput` 纯函数，无需 V2 运行时（`@opencode/plugin` 在测试环境缺省时退化为最小 define）

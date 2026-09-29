@@ -245,33 +245,50 @@ async function createTestEnv(keys) {
   return dir
 }
 
-/** 加载插件，获取 hooks */
-async function getHooks(dir) {
-  const { default: OpenSecret } = await import("../src/index.js")
-  return await OpenSecret({ directory: dir })
-}
-
 /**
- * 通过 messages.transform hook 脱敏文本
+ * 加载配置并构建一套 V2 形态的处理器（共享会话）。
+ * V2 的 context hook 不带 sessionID，整个进程共用一张映射表，
+ * 因此这里用单个 PlaceholderSession 模拟「active 实例持有的共享会话」。
  */
-async function redactViaHook(hooks, sessionID, text) {
-  const msg = {
-    messages: [{
-      info: { sessionID },
-      parts: [{ type: "text", text }],
-    }],
+async function buildHandlers(dir) {
+  const { loadConfig } = await import("../src/config.js")
+  const { buildPatternSet } = await import("../src/patterns.js")
+  const { PlaceholderSession } = await import("../src/session.js")
+  const { createLogger } = await import("../src/logger.js")
+  const { redactEvent, restoreResponseText } = await import("../src/index.js")
+
+  const logger = createLogger({ level: "off" })
+  const config = await loadConfig(dir, logger)
+  const patterns = buildPatternSet(config.patterns)
+  const session = new PlaceholderSession({
+    prefix: config.prefix,
+    ttlMs: config.ttlMs,
+    maxMappings: config.maxMappings,
+  })
+  return {
+    config,
+    redact: (text) => {
+      const event = { messages: [{ role: "user", content: [{ type: "text", text }] }] }
+      redactEvent(event, session, patterns, logger)
+      return event.messages[0].content[0].text
+    },
+    restore: (text) => restoreResponseText(text, session),
   }
-  await hooks["experimental.chat.messages.transform"]({}, msg)
-  return msg.messages[0].parts[0].text
 }
 
-/**
- * 通过 text.complete hook 还原文本
- */
-async function restoreViaHook(hooks, sessionID, text) {
-  const output = { text }
-  await hooks["experimental.text.complete"]({ sessionID }, output)
-  return output.text
+/** 加载配置 + 共享会话（主用例组使用） */
+async function getHooks(dir) {
+  return await buildHandlers(dir)
+}
+
+/** 通过 context hook 等价物脱敏文本 */
+function redactViaHook(hooks, _sessionID, text) {
+  return hooks.redact(text)
+}
+
+/** 通过 http.response hook 等价物还原文本 */
+function restoreViaHook(hooks, _sessionID, text) {
+  return hooks.restore(text)
 }
 
 // =============================================
@@ -397,8 +414,10 @@ describe("验收测试：AI Key 脱敏与还原", () => {
       await fs.writeFile(path.join(dir, "oh-my-opensecret.yaml"), cfgYaml, "utf8")
 
       // 加载配置（会触发 auto-discovery）
-      const { default: OpenSecret } = await import("../src/index.js")
-      const h = await OpenSecret({ directory: dir })
+      const { loadConfig } = await import("../src/config.js")
+      const { createLogger } = await import("../src/logger.js")
+      const logger = createLogger({ level: "off" })
+      const h = await loadConfig(dir, logger)
 
       // 读回配置文件，检查自动生成的规则
       const content = await fs.readFile(path.join(dir, "oh-my-opensecret.yaml"), "utf8")
@@ -435,8 +454,10 @@ describe("验收测试：AI Key 脱敏与还原", () => {
         apiKey: "sk-test-key-12345",
       }), "utf8")
 
-      const { default: OpenSecret } = await import("../src/index.js")
-      await OpenSecret({ directory: dir })
+      const { loadConfig } = await import("../src/config.js")
+      const { createLogger } = await import("../src/logger.js")
+      const logger = createLogger({ level: "off" })
+      await loadConfig(dir, logger)
 
       const content = await fs.readFile(path.join(dir, "oh-my-opensecret.yaml"), "utf8")
       // 手动配置的规则应保留
@@ -512,29 +533,25 @@ describe("验收测试：AI Key 脱敏与还原", () => {
     })
   })
 
-  // ---- 测试组 9：同 session 同原文复用占位符 ----
-  describe("同 session 内稳定映射", () => {
-    it("同一原文在同一 session 中生成相同占位符", async () => {
-      const sessionID = "stable-session"
+  // ---- 测试组 9：同进程内稳定映射 ----
+  describe("进程内稳定映射 (V2 共享密钥)", () => {
+    it("同一原文在同一处理实例中生成相同占位符", async () => {
       const raw = "sk-" + "d".repeat(48)
 
-      const r1 = await redactViaHook(hooks, sessionID, raw)
-      const r2 = await redactViaHook(hooks, sessionID, raw)
-      assert.equal(r1, r2, "同一 session 中相同原文应映射到相同占位符")
+      const r1 = await redactViaHook(hooks, "any-1", raw)
+      const r2 = await redactViaHook(hooks, "any-1", raw)
+      assert.equal(r1, r2, "同一处理实例中相同原文应映射到相同占位符")
     })
 
-    it("不同 session 中同一原文生成不同占位符", async () => {
+    it("V2 进程级共享密钥：不同来源同一原文共用占位符", async () => {
       const raw = "sk-" + "e".repeat(48)
 
       const r1 = await redactViaHook(hooks, "session-a", raw)
       const r2 = await redactViaHook(hooks, "session-b", raw)
-      // 不同 session 使用不同随机 secret，占位符应不同
-      // 但 hash 有可能恰好相同（极小概率），所以不严格相等
-      // 验证它们不同即可（概率上几乎总是不同）
-      // 实际上由于 HMAC secret 不同，hash12 极大概率不同
-      // 我们验证占位符格式正确即可
+      // V2 不再有 per-session 随机 secret，整个进程共用一把密钥，
+      // 因此任何来源脱敏的同一原文都映射到同一占位符。
+      assert.equal(r1, r2, "V2 共享密钥下，同一原文在所有来源都映射到相同占位符")
       assert.ok(r1.startsWith("__OMOS_"))
-      assert.ok(r2.startsWith("__OMOS_"))
     })
   })
 })
