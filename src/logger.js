@@ -2,7 +2,7 @@ import * as fs from "node:fs"
 import * as path from "node:path"
 import os from "node:os"
 
-const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 }
+const LEVELS = { debug: 0, info: 1, warn: 2, error: 3, off: 4 }
 
 /**
  * 展开路径中的 ~ 为 $HOME。
@@ -11,23 +11,50 @@ const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 }
  */
 function resolvePath(p) {
   if (!p || typeof p !== "string") return ""
+  if (p === "~") return os.homedir()
   if (p.startsWith("~/")) return path.join(os.homedir(), p.slice(2))
   return p
 }
 
 /**
+ * 把外部传入的级别名映射为内部数值。非法值抛错，不做静默回退。
+ * @param {string|undefined} level
+ * @returns {number}
+ */
+function normalizeLevel(level) {
+  if (level === undefined || level === null) return LEVELS.info
+  if (typeof level === "string" && level in LEVELS) return LEVELS[level]
+  throw new Error(
+    `未知的日志级别 ${JSON.stringify(level)}，合法值: ${Object.keys(LEVELS).join(" | ")}`,
+  )
+}
+
+/**
  * 解析文件大小字符串（如 "10m", "100k", "1g"）为字节数。
+ * 无法解析或单位未知时抛错，不做静默回退。
  * @param {string|number} s
  * @returns {number}
  */
 function parseSize(s) {
-  if (typeof s === "number") return s
-  const m = String(s).match(/^(\d+(?:\.\d+)?)\s*(k|m|g|b)?$/i)
-  if (!m) return 10 * 1024 * 1024
-  const v = parseFloat(m[1])
-  const u = (m[2] || "b").toLowerCase()
+  if (typeof s === "number") {
+    if (!Number.isFinite(s) || s <= 0) {
+      throw new Error(`日志大小非法 ${JSON.stringify(s)}，必须为正数`)
+    }
+    return s
+  }
+  const raw = String(s)
+  const m = raw.match(/^(\d+(?:\.\d+)?)\s*([a-z]+)?$/i)
+  if (!m) {
+    throw new Error(`无法解析日志大小 ${JSON.stringify(raw)}，格式示例: "10m" / "100k" / "1g"`)
+  }
   const units = { b: 1, k: 1024, m: 1024 * 1024, g: 1024 * 1024 * 1024 }
-  return Math.round(v * (units[u] || 1))
+  const u = (m[2] || "b").toLowerCase()
+  if (!(u in units)) {
+    throw new Error(
+      `未知的日志大小单位 ${JSON.stringify(m[2])}（来自 ${JSON.stringify(raw)}），合法值: b | k | m | g`,
+    )
+  }
+  return Math.round(parseFloat(m[1]) * units[u])
 }
 
 /**
@@ -54,11 +81,7 @@ export class Logger {
    * }} opts
    */
   constructor(opts = {}) {
-    this.level = LEVELS[opts.level] ?? LEVELS.info
-    this.filePath = resolvePath(opts.filePath ?? "")
     this.prefix = opts.prefix ?? "[oh-my-opensecret]"
-    this.maxSize = parseSize(opts.maxSize ?? "10m")
-    this.maxFiles = opts.maxFiles ?? 7
 
     /** @type {fs.WriteStream|null} */
     this._fileStream = null
@@ -66,6 +89,31 @@ export class Logger {
     this._currentDate = ""
     /** 目录是否已创建 */
     this._dirEnsured = false
+
+    this.applyConfig({
+      level: opts.level,
+      file: opts.filePath,
+      maxSize: opts.maxSize,
+      maxFiles: opts.maxFiles,
+    })
+  }
+
+  /**
+   * 用配置文件的 `logging` 段覆盖当前设置：级别名 → 数值、路径展开 `~`、大小字符串 → 字节数。
+   * 这是设置这些字段的唯一入口 —— 直接写 `logger.level` / `logger.filePath` / `logger.maxSize`
+   * 会把原始字符串塞进去，导致级别过滤与按大小滚动静默失效。
+   * @param {{ level?: string, file?: string, maxSize?: string|number, maxFiles?: number }} logging
+   */
+  applyConfig(logging) {
+    // 先全部归一化再赋值：任一字段非法时抛错，且已生效的配置保持原样不被部分改写
+    const level = normalizeLevel(logging?.level)
+    const filePath = resolvePath(logging?.file ?? "")
+    const maxSize = parseSize(logging?.maxSize ?? "10m")
+    const maxFiles = logging?.maxFiles ?? 7
+    this.level = level
+    this.filePath = filePath
+    this.maxSize = maxSize
+    this.maxFiles = maxFiles
   }
 
   /**
@@ -97,28 +145,9 @@ export class Logger {
   warn(...args) { this.log("warn", ...args) }
   error(...args) { this.log("error", ...args) }
 
-  close() {
-    if (this._fileStream) {
-      this._fileStream.end()
-      this._fileStream = null
-    }
-  }
-
   /** @returns {Promise<void>} 等待缓冲区写入完成 */
   flush() {
     return new Promise((resolve) => {
-      if (this._fileStream) {
-        this._fileStream.end(resolve)
-        this._fileStream = null
-      } else {
-        resolve()
-      }
-    })
-  }
-
-  /** @returns {Promise<void>} 等待缓冲区写入完成 */
-  flush() {
-    return new Promise((resolve, reject) => {
       if (this._fileStream) {
         this._fileStream.end(resolve)
         this._fileStream = null
@@ -207,7 +236,9 @@ export class Logger {
     // 重命名当前文件
     try {
       fs.renameSync(this.filePath, path.join(dir, `${base}.${today}.${maxSeq + 1}${ext}`))
-    } catch { /* 当前文件可能不存在 */ }
+    } catch (err) {
+      this._reportFault(`日志滚动重命名失败（滚动与历史清理将停止）`, err)
+    }
 
     this._prune(dir, base, ext)
   }
@@ -221,10 +252,24 @@ export class Logger {
       const rotated = files.filter((f) => pattern.test(f)).sort().reverse()
       if (rotated.length > this.maxFiles) {
         for (const f of rotated.slice(this.maxFiles)) {
-          try { fs.unlinkSync(path.join(dir, f)) } catch { /* skip */ }
+          try {
+            fs.unlinkSync(path.join(dir, f))
+          } catch (err) {
+            this._reportFault(`历史日志删除失败（磁盘占用会持续增长）: ${f}`, err)
+          }
         }
       }
     } catch { /* 忽略 */ }
+  }
+
+  /**
+   * logger 自身的故障无法写进日志文件（会递归），只能落到 stderr。
+   * @param {string} what
+   * @param {unknown} err
+   */
+  _reportFault(what, err) {
+    const detail = err instanceof Error ? err.message : String(err)
+    process.stderr.write(`[oh-my-opensecret] ${what}: ${detail}\n`)
   }
 }
 
@@ -232,6 +277,6 @@ function escapeRegex(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 }
 
-export function createLogger(opts) {
+export function createLogger(opts = {}) {
   return new Logger(opts)
 }

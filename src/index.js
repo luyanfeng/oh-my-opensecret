@@ -14,10 +14,9 @@ import { ProcessSingleton } from "./singleton.js"
  * `ctx.session.hook(name, cb)` / `ctx.tool.hook(name, cb)` 注册 hook，
  * 并返回 cleanup 函数（可选）。
  *
- * Hook 映射（不再兼容 V1）：
- * - V1 `experimental.chat.messages.transform` → V2 `session.hook("context")`   （请求前脱敏）
- * - V1 `experimental.text.complete`          → V2 `session.hook("http.response")`（响应后还原）
- * - V1 `tool.execute.before`                 → V2 `tool.hook("execute.before")` （工具参数还原）
+ * 注册的 hook：
+ * - `session.hook("context")`      LLM 请求前脱敏
+ * - `tool.hook("execute.before")`  工具参数还原
  *
  * 进程级单例：每个 location 各加载一份插件实例，但仅有「最新注册者」实例真正注册
  * hook（见 singleton.js），确保同一 server 进程只有一个本插件实现在生效。
@@ -81,7 +80,7 @@ export function redactEvent(event, session, patterns, logger) {
       if (typeof part.text === "string") {
         const before = part.text
         part.text = redactText(before, patterns, session).text
-        if (part.text !== before) log(`脱敏 text: 已替换敏感片段`)
+        if (part.text !== before) log("脱敏 text: 已替换敏感片段")
       }
     } else if (part.type === "tool-call") {
       if (part.input && typeof part.input === "object") {
@@ -108,8 +107,6 @@ export function redactEvent(event, session, patterns, logger) {
 
 /**
  * 还原一段文本中的占位符。纯函数，供单测直接调用与 `restore.js` 复用。
- * 注：V2 的 `http.response` hook 已验证无法影响 TUI 展示（server 不消费替换后的 body），
- * 当前插件采用「脱敏单向、不还原」策略，不再注册该 hook；本导出保留还原能力供后续方案使用。
  * @param {string} text
  * @param {{ lookup(ph: string): string | undefined, prefix: string }} session
  * @returns {string}
@@ -119,19 +116,20 @@ export function restoreResponseText(text, session) {
 }
 
 /**
- * 工具参数还原（in-place）：深度还原 `input` 中的占位符。
+ * 工具参数还原：深度还原 `input` 中的占位符，返回还原后的新对象，不修改入参。
  * 供 `tool.hook("execute.before")` 调用，也可被单测直接调用。
  * @param {unknown} input
  * @param {{ lookup(ph: string): string | undefined, prefix: string }} session
+ * @returns {unknown} 还原后的新树
  */
 export function restoreInput(input, session) {
-  restoreDeep(input, session)
+  return restoreDeep(input, session)
 }
 
 export default Plugin.define({
   id: "oh-my-opensecret",
   async setup(ctx) {
-    // 1. 加载配置（含自举 + 自动发现）。目录用 V2 的 location.directory。
+    // 1. 加载配置（含自举 + 自动发现）
     const directory = String(ctx?.location?.directory ?? process.cwd())
     const logger = createLogger({
       level: "info",
@@ -141,10 +139,8 @@ export default Plugin.define({
       maxFiles: 7,
     })
     const config = await loadConfig(directory, logger)
-    logger.level = config.logging.level
-    logger.filePath = config.logging.file
-    logger.maxSize = config.logging.maxSize
-    logger.maxFiles = config.logging.maxFiles
+    // 配置值统一走 logger 内部归一化（级别映射 / ~ 展开 / 大小解析），不可直接赋值字段。
+    logger.applyConfig(config.logging)
 
     if (!config.enabled) {
       logger.info("插件已禁用（enabled=false），不注册 hook")
@@ -155,8 +151,11 @@ export default Plugin.define({
     const patterns = buildPatternSet(config.patterns)
 
     // 3. 进程级共享占位符会话（active 实例持有，密钥进程内唯一）。
-    //    注意：V2 的 context hook 不带 sessionID，无法区分会话，
-    //    故整个 server 进程共用一把 HMAC 密钥与一张映射表（密钥不出本机）。
+    //    整个 server 进程共用一把 HMAC 密钥与一张映射表（密钥不出本机）。
+    //    注：当初的理由是「V2 的 context hook 不带 sessionID」，但该前提未实测验证
+    //    （官方类型 SessionContext 声明了 readonly sessionID，类型层存在不等于运行时填充）。
+    //    进程级共享本身是更保守的选择，结论不受该前提影响；若后续实测确认运行时可用
+    //    sessionID，可重新评估是否需要按会话隔离。
     /** @type {PlaceholderSession | null} */
     let session = null
     /** @type {Array<{ dispose(): void }>} */
@@ -171,12 +170,14 @@ export default Plugin.define({
     const makeToolHandler = () => async (event) => {
       if (!session) return
       session.cleanup()
-      restoreInput(event?.input, session)
+      if (!event || !("input" in event)) return
+      // 宿主已冻结 event.input 的值，原地改会抛 Attempted to assign to readonly property；
+      // hook 回调的返回值不被消费，return { input } 无效 —— 只能整体替换引用。
+      event.input = restoreInput(event.input, session)
     }
 
     // 4. 进程级单例：仅 active 实例注册 hook。
     const singleton = new ProcessSingleton({
-      id: directory,
       activate: () => {
         session = new PlaceholderSession({
           prefix: config.prefix,
@@ -188,7 +189,11 @@ export default Plugin.define({
       },
       deactivate: () => {
         for (const r of registrations) {
-          try { r.dispose() } catch { /* 忽略已释放的 registration */ }
+          try {
+            r.dispose()
+          } catch (err) {
+            logger.debug(`释放 hook registration 失败: ${err?.message ?? err}`)
+          }
         }
         registrations = []
         session = null

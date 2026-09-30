@@ -28,7 +28,7 @@ function subtractCovered(start, end, covered) {
  */
 function isPlaceholderLike(s, prefix) {
   const esc = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-  return new RegExp(`^${esc}[A-Z]+_[A-Z0-9_]+_[a-f0-9]{12}__$`).test(String(s ?? ""))
+  return new RegExp(`^${esc}[A-Z]+_[A-Z0-9_]+_[a-f0-9]{12}(?:_\\d+)?__$`).test(String(s ?? ""))
 }
 
 /**
@@ -60,28 +60,6 @@ function insertCovered(covered, span) {
 }
 
 /**
- * 从 pattern 中提取正则标志（兼容 /pattern/flags 字面量语法）。
- * @param {string} pattern
- * @returns {{ pattern: string, flags: string }}
- */
-function parsePatternFlags(pattern) {
-  let p = String(pattern ?? "")
-  let f = ""
-  const literalMatch = p.match(/^\/(.+)\/([gimsuvy]*)$/s)
-  if (literalMatch) {
-    p = literalMatch[1]
-    f = literalMatch[2]
-  }
-  for (;;) {
-    if (p.startsWith("(?i)")) { p = p.slice(4); if (!f.includes("i")) f += "i"; continue }
-    if (p.startsWith("(?m)")) { p = p.slice(4); if (!f.includes("m")) f += "m"; continue }
-    if (p.startsWith("(?s)")) { p = p.slice(4); if (!f.includes("s")) f += "s"; continue }
-    break
-  }
-  return { pattern: p, flags: f }
-}
-
-/**
  * 扫描文本中所有已有占位符的区间。
  * 占位符格式：{PREFIX}_{CATEGORY}_{hash12}__ 或 {PREFIX}_{CATEGORY}_{hash12}_N__
  * @param {string} text
@@ -90,7 +68,11 @@ function parsePatternFlags(pattern) {
  */
 function collectPlaceholderRanges(text, prefix) {
   const esc = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-  const re = new RegExp(`${esc}[A-Z]+_[A-Z0-9_]+_[a-f0-9]{12}(?:_\\d+)?__`, "g")
+  // 类别段必须非贪婪：sanitizeCategory 允许类别含下划线（如 DB_CONNECTION），
+  // 贪婪匹配会把相邻两个占位符合并成一个区间，使中间的真实内容落入 skip range 而漏脱敏。
+  // 非贪婪下命中的第一个匹配即占位符自身边界——类别内部的 `_` 之后必然还跟 `_+hash12__`，
+  // 其中含非 hex 的 `_`，不可能凑出「12 位 hex + `__`」提前收尾。
+  const re = new RegExp(`${esc}[A-Z]+_[A-Z0-9_]+?_[a-f0-9]{12}(?:_\\d+)?__`, "g")
   const ranges = []
   for (const m of text.matchAll(re)) {
     ranges.push({ start: m.index, end: m.index + m[0].length })
@@ -123,7 +105,7 @@ function isExcluded(original, exclude) {
  * 4. 从右到左替换，避免 index 偏移
  *
  * @param {string} input 原始文本
- * @param {{ keywords: Array<{value:string,placeholderId:string}>, regex: Array<{pattern:string,placeholderId:string}>, exclude: { exact: Set<string>, glob: Array<{raw:string,re:RegExp}> } }} patterns
+ * @param {{ keywords: Array<{value:string,placeholderId:string}>, regex: Array<{pattern:string,flags:string,placeholderId:string}>, exclude: { exact: Set<string>, glob: Array<{raw:string,re:RegExp}> } }} patterns
  * @param {{ getOrCreatePlaceholder(original: string, placeholderId: string): string }} session
  * @param {string} [placeholderPrefix] 占位符前缀，用于跳过已脱敏的值
  * @returns {{ text: string, matches: Array<{start:number,end:number,original:string,placeholderId:string,placeholder?:string}> }}
@@ -168,17 +150,10 @@ export function redactText(input, patterns, session, placeholderPrefix) {
     }
   }
 
-  // Regex 匹配
+  // Regex 匹配（规则由 buildPatternSet 编译，pattern 已剥离字面量包装、flags 已解析）
   for (const rule of patterns.regex) {
-    const parsed = parsePatternFlags(rule.pattern)
-    let flags = parsed.flags
-    if (!flags.includes("g")) flags = "g" + flags
-    let re
-    try {
-      re = new RegExp(parsed.pattern, flags)
-    } catch {
-      continue // 跳过无效正则
-    }
+    const flags = rule.flags.includes("g") ? rule.flags : "g" + rule.flags
+    const re = new RegExp(rule.pattern, flags)
     for (const m of text.matchAll(re)) {
       if (!m[0]) continue
       const start = m.index ?? -1

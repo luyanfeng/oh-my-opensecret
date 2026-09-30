@@ -121,10 +121,55 @@ function parsePatternFlags(pattern) {
 }
 
 /**
- * 从用户配置构建完整的模式集。
+ * 编译正则规则（自定义 + 内置）为统一结构。
+ *
+ * 运行时脱敏（buildPatternSet）与 auto-discovery 覆盖判定
+ * （config.js expandPatternsWithMeta）必须共用本函数，否则两侧对
+ * `/regex/flags` 与 `(?i)` 内联前缀的解析结果会不一致。
+ *
  * @param {object} raw 原始 patterns 配置
- * @returns {{ keywords: Array<{value:string,placeholderId:string}>, regex: Array<{pattern:string,placeholderId:string}>, exclude: Set<string> }}
+ * @returns {Array<{ pattern: string, flags: string, placeholderId: string, source: "custom"|"builtin", description: string }>}
  */
+function compileRegexRules(raw) {
+  const patterns = raw && typeof raw === "object" ? raw : {}
+  const rules = []
+
+  const custom = Array.isArray(patterns.regex) ? patterns.regex : []
+  for (const x of custom) {
+    if (!x || typeof x !== "object") continue
+    const source = String(x.pattern ?? "").trim()
+    if (!source) continue
+    // YAML 中可能是 placeholder-id，JS 对象中可能是 placeholderId
+    const placeholderId = sanitizeCategory(x.placeholderId ?? x["placeholder-id"])
+    const parsed = parsePatternFlags(source)
+    rules.push({
+      pattern: parsed.pattern,
+      flags: parsed.flags,
+      placeholderId,
+      source: "custom",
+      description: placeholderId,
+    })
+  }
+
+  const builtin = Array.isArray(patterns.builtin) ? patterns.builtin : []
+  for (const name of builtin) {
+    const key = String(name ?? "").trim()
+    if (!key) continue
+    const rule = BUILTIN.get(key)
+    if (!rule) continue
+    const parsed = parsePatternFlags(rule.pattern)
+    rules.push({
+      pattern: parsed.pattern,
+      flags: parsed.flags,
+      placeholderId: sanitizeCategory(rule.placeholderId),
+      source: "builtin",
+      description: rule.description || key,
+    })
+  }
+
+  return rules
+}
+
 /**
  * 将简单的 glob 模式（仅支持 * 和 ?）转换为 RegExp。
  * - `*` 匹配任意非空字符序列（类似 shell glob，不跨多行）
@@ -149,12 +194,15 @@ function globToRegex(glob) {
   return new RegExp("^" + src + "$")
 }
 
+/**
+ * 从用户配置构建完整的模式集。
+ * @param {object} raw 原始 patterns 配置
+ * @returns {{ keywords: Array<{value:string,placeholderId:string}>, regex: Array<{pattern:string,flags:string,placeholderId:string}>, exclude: { exact: Set<string>, glob: Array<{raw:string,re:RegExp}> } }}
+ */
 export function buildPatternSet(raw) {
   const patterns = raw && typeof raw === "object" ? raw : {}
 
   const keywords = Array.isArray(patterns.keywords) ? patterns.keywords : []
-  const regex = Array.isArray(patterns.regex) ? patterns.regex : []
-  const builtin = Array.isArray(patterns.builtin) ? patterns.builtin : []
   const exclude = Array.isArray(patterns.exclude) ? patterns.exclude : []
 
   const keywordRules = keywords
@@ -162,29 +210,15 @@ export function buildPatternSet(raw) {
       if (!x || typeof x !== "object") return null
       const value = String(x.value ?? "").trim()
       if (!value) return null
-      return { value, placeholderId: sanitizeCategory(x.placeholderId) }
+      return { value, placeholderId: sanitizeCategory(x.placeholderId ?? x["placeholder-id"]) }
     })
     .filter(Boolean)
 
-  const regexRules = []
-  for (const x of regex) {
-    if (!x || typeof x !== "object") continue
-    const pattern = String(x.pattern ?? "").trim()
-    if (!pattern) continue
-    // YAML 中可能是 placeholder-id，JS 对象中可能是 placeholderId
-    const pid = x.placeholderId ?? x["placeholder-id"]
-    const placeholderId = sanitizeCategory(pid)
-    const parsed = parsePatternFlags(pattern)
-    regexRules.push({ pattern: parsed.pattern, placeholderId })
-  }
-
-  for (const name of builtin) {
-    const key = String(name ?? "").trim()
-    if (!key) continue
-    const rule = BUILTIN.get(key)
-    if (!rule) continue
-    regexRules.push({ pattern: rule.pattern, placeholderId: rule.placeholderId })
-  }
+  const regexRules = compileRegexRules(patterns).map((r) => ({
+    pattern: r.pattern,
+    flags: r.flags,
+    placeholderId: r.placeholderId,
+  }))
 
   // exclude 支持精确字符串和 glob 模式（含 * 或 ?）
   const exactSet = new Set()
@@ -206,4 +240,4 @@ export function buildPatternSet(raw) {
   }
 }
 
-export { BUILTIN, parsePatternFlags }
+export { BUILTIN, parsePatternFlags, compileRegexRules }

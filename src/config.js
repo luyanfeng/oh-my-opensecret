@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import yaml from "js-yaml"
-import { BUILTIN, parsePatternFlags } from "./patterns.js"
+import { compileRegexRules } from "./patterns.js"
 
 const CONFIG_FILENAME = "oh-my-opensecret.yaml"
 const ENV_CONFIG_PATH = "OPENCODE_SECRET_CONFIG"
@@ -13,70 +13,96 @@ const ENV_CONFIG_PATH = "OPENCODE_SECRET_CONFIG"
  * @param {string} input
  * @returns {number}
  */
-function parseDurationMs(input) {
-  const raw = String(input ?? "").trim()
-  if (!raw) return 60 * 60 * 1000
+const DEFAULT_TTL_MS = 60 * 60 * 1000
 
-  const m = raw.match(/^(\d+(?:\.\d+)?)(ms|s|m|h|d)$/)
-  if (!m) return 60 * 60 * 1000
+const DURATION_RE = /^(\d+(?:\.\d+)?)(ms|s|m|h|d)$/
+const DURATION_UNITS = { ms: 1, s: 1000, m: 60 * 1000, h: 60 * 60 * 1000, d: 24 * 60 * 60 * 1000 }
 
-  const value = Number(m[1])
-  const unit = m[2]
-  if (!Number.isFinite(value) || value < 0) return 60 * 60 * 1000
-
-  const units = { ms: 1, s: 1000, m: 60 * 1000, h: 60 * 60 * 1000, d: 24 * 60 * 60 * 1000 }
-  return value * (units[unit] || 60 * 60 * 1000)
+/**
+ * 校验时长字符串格式。
+ * @param {string} input
+ * @param {string} field 字段路径，用于错误信息
+ */
+function assertDurationFormat(input, field) {
+  const raw = String(input).trim()
+  if (!DURATION_RE.test(raw)) {
+    throw new Error(
+      `${field} 格式非法: ${JSON.stringify(raw)} — 合法格式为 数字+单位（ms/s/m/h/d），如 "30m"、"1h"、"7d"`,
+    )
+  }
 }
 
-/** 展开 ~ 为当前用户 home 目录 */
-function expandHome(p) {
-  if (typeof p !== "string") return p
-  if (p.startsWith("~" + path.sep) || p === "~") {
-    return path.join(os.homedir(), p.slice(1))
-  }
-  return p
+/**
+ * 解析时长字符串为毫秒数。字段缺失时返回默认 1h，字段非法时抛错。
+ * @param {string} input
+ * @param {string} field 字段路径，用于错误信息
+ * @returns {number}
+ */
+function parseDurationMs(input, field = "session.ttl") {
+  if (input === undefined || input === null) return DEFAULT_TTL_MS
+
+  assertDurationFormat(input, field)
+  const [, value, unit] = String(input).trim().match(DURATION_RE)
+  return Number(value) * DURATION_UNITS[unit]
 }
 
 // ---- 配置 Schema 校验 ----
 
+/** 描述实际值的类型，便于用户定位配置错误 */
+function typeName(value) {
+  if (value === null) return "null"
+  if (Array.isArray(value)) return "array"
+  return typeof value
+}
+
+/** 描述实际值（字符串加引号并截断），避免错误信息本身过长 */
+function describeValue(value) {
+  if (typeof value === "string") {
+    const shown = value.length > 40 ? value.slice(0, 40) + "…" : value
+    return `${typeName(value)} ${JSON.stringify(shown)}`
+  }
+  return typeName(value)
+}
+
 /**
- * 校验并规范化原始配置对象。
+ * 校验原始配置对象，收集全部错误。
+ * 只在「字段缺失」时允许后续补默认值；「字段非法」一律记为错误。
  * @param {any} raw
- * @returns {{ valid: boolean, errors: string[], config: import("./config.js").NormalizedConfig }}
+ * @returns {string[]}
  */
 function validateSchema(raw) {
   const errors = []
 
-  if (!raw || typeof raw !== "object") {
-    return { valid: false, errors: ["config must be an object"], config: null }
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return [`config must be an object (actual: ${typeName(raw)})`]
   }
 
   // enabled
   if (raw.enabled !== undefined && typeof raw.enabled !== "boolean") {
-    errors.push("enabled must be a boolean")
+    errors.push(`enabled must be a boolean (actual: ${describeValue(raw.enabled)})`)
   }
 
   // logging
-  if (raw.logging !== undefined) {
-    if (typeof raw.logging !== "object" || raw.logging === null) {
-      errors.push("logging must be an object")
+  if (raw.logging !== undefined && raw.logging !== null) {
+    if (typeof raw.logging !== "object" || Array.isArray(raw.logging)) {
+      errors.push(`logging must be an object (actual: ${typeName(raw.logging)})`)
     } else {
       const validLevels = ["debug", "info", "warn", "error"]
       if (raw.logging.level !== undefined && !validLevels.includes(raw.logging.level)) {
-        errors.push(`logging.level must be one of: ${validLevels.join(", ")}`)
+        errors.push(`logging.level must be one of: ${validLevels.join(", ")} (actual: ${describeValue(raw.logging.level)})`)
       }
       if (raw.logging.file !== undefined && typeof raw.logging.file !== "string") {
-        errors.push("logging.file must be a string")
+        errors.push(`logging.file must be a string (actual: ${typeName(raw.logging.file)})`)
       }
-      if (raw.logging.rotation !== undefined) {
-        if (typeof raw.logging.rotation !== "object" || raw.logging.rotation === null) {
-          errors.push("logging.rotation must be an object")
+      if (raw.logging.rotation !== undefined && raw.logging.rotation !== null) {
+        if (typeof raw.logging.rotation !== "object" || Array.isArray(raw.logging.rotation)) {
+          errors.push(`logging.rotation must be an object (actual: ${typeName(raw.logging.rotation)})`)
         } else {
           if (raw.logging.rotation.max_size !== undefined && typeof raw.logging.rotation.max_size !== "string" && typeof raw.logging.rotation.max_size !== "number") {
-            errors.push("logging.rotation.max_size must be a string or number")
+            errors.push(`logging.rotation.max_size must be a string or number (actual: ${typeName(raw.logging.rotation.max_size)})`)
           }
           if (raw.logging.rotation.max_files !== undefined && (!Number.isInteger(raw.logging.rotation.max_files) || raw.logging.rotation.max_files < 1)) {
-            errors.push("logging.rotation.max_files must be a positive integer")
+            errors.push(`logging.rotation.max_files must be a positive integer (actual: ${describeValue(raw.logging.rotation.max_files)})`)
           }
         }
       }
@@ -85,58 +111,84 @@ function validateSchema(raw) {
 
   // auto_discovery
   if (raw.auto_discovery !== undefined && typeof raw.auto_discovery !== "boolean") {
-    errors.push("auto_discovery must be a boolean")
+    errors.push(`auto_discovery must be a boolean (actual: ${describeValue(raw.auto_discovery)})`)
   }
 
   // placeholder_prefix
   if (raw.placeholder_prefix !== undefined && (typeof raw.placeholder_prefix !== "string" || !raw.placeholder_prefix)) {
-    errors.push("placeholder_prefix must be a non-empty string")
+    errors.push(`placeholder_prefix must be a non-empty string (actual: ${describeValue(raw.placeholder_prefix)})`)
   }
 
   // session
-  if (raw.session !== undefined) {
-    if (typeof raw.session !== "object") {
-      errors.push("session must be an object")
+  if (raw.session !== undefined && raw.session !== null) {
+    if (typeof raw.session !== "object" || Array.isArray(raw.session)) {
+      errors.push(`session must be an object (actual: ${typeName(raw.session)})`)
     } else {
-      if (raw.session.ttl !== undefined && typeof raw.session.ttl !== "string") {
-        errors.push("session.ttl must be a string (e.g. '1h')")
+      if (raw.session.ttl !== undefined) {
+        if (typeof raw.session.ttl !== "string") {
+          errors.push(`session.ttl must be a string (actual: ${typeName(raw.session.ttl)})`)
+        } else {
+          try {
+            assertDurationFormat(raw.session.ttl, "session.ttl")
+          } catch (err) {
+            errors.push(err.message)
+          }
+        }
       }
       if (raw.session.max_mappings !== undefined && (!Number.isFinite(raw.session.max_mappings) || raw.session.max_mappings < 1)) {
-        errors.push("session.max_mappings must be a positive number")
+        errors.push(`session.max_mappings must be a positive number (actual: ${describeValue(raw.session.max_mappings)})`)
       }
     }
   }
 
   // patterns
-  if (raw.patterns !== undefined) {
-    if (typeof raw.patterns !== "object") {
-      errors.push("patterns must be an object")
+  if (raw.patterns !== undefined && raw.patterns !== null) {
+    if (typeof raw.patterns !== "object" || Array.isArray(raw.patterns)) {
+      errors.push(`patterns must be an object (actual: ${typeName(raw.patterns)})`)
     } else {
-      if (raw.patterns.keywords !== undefined && !Array.isArray(raw.patterns.keywords)) {
-        errors.push("patterns.keywords must be an array")
-      }
-      if (raw.patterns.regex !== undefined && !Array.isArray(raw.patterns.regex)) {
-        errors.push("patterns.regex must be an array")
-      }
-      if (raw.patterns.builtin !== undefined && !Array.isArray(raw.patterns.builtin)) {
-        errors.push("patterns.builtin must be an array")
-      }
-      if (raw.patterns.exclude !== undefined && !Array.isArray(raw.patterns.exclude)) {
-        errors.push("patterns.exclude must be an array")
+      for (const key of ["keywords", "regex", "builtin", "exclude"]) {
+        const value = raw.patterns[key]
+        // 空键（`regex:` 后只有注释）解析为 null，等价于未设置
+        if (value !== undefined && value !== null && !Array.isArray(value)) {
+          errors.push(`patterns.${key} must be an array (actual: ${typeName(value)})`)
+        }
       }
     }
   }
 
-  return { valid: errors.length === 0, errors, config: raw }
+  // 正则规则可编译性
+  if (raw.patterns && typeof raw.patterns === "object" && !Array.isArray(raw.patterns)) {
+    for (const rule of compileRegexRules(raw.patterns)) {
+      const reason = regexCompileError(rule)
+      if (reason) {
+        errors.push(`patterns.${rule.source === "builtin" ? "builtin" : "regex"} 规则非法（placeholder-id: ${rule.placeholderId}）: ${reason}`)
+      }
+    }
+  }
+
+  return errors
+}
+
+/** 正则规则是否可编译，非法时返回原因（用于 schema 校验阶段） */
+function regexCompileError(rule) {
+  const flags = rule.flags.includes("g") ? rule.flags : "g" + rule.flags
+  try {
+    // eslint-disable-next-line no-new
+    new RegExp(rule.pattern, flags)
+    return null
+  } catch (err) {
+    return `/${rule.pattern}/${rule.flags} — ${err.message}`
+  }
 }
 
 /**
- * 将原始配置规范化（补全默认值）。
+ * 将原始配置规范化（仅为缺失字段补默认值）。
+ * 调用前必须已通过 validateSchema：非法值在此处直接抛错，不做静默兜底。
  * @param {any} raw
  * @returns {NormalizedConfig}
  */
 function normalizeConfig(raw) {
-  const cfg = raw && typeof raw === "object" ? raw : {}
+  const cfg = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}
 
   const enabled = cfg.enabled !== false
 
@@ -144,21 +196,18 @@ function normalizeConfig(raw) {
   const logCfg = cfg.logging && typeof cfg.logging === "object" ? cfg.logging : {}
   const rotCfg = logCfg.rotation && typeof logCfg.rotation === "object" ? logCfg.rotation : {}
   const logging = {
-    level: logCfg.level || "info",
-    file: expandHome(logCfg.file || "~/.oh-my-opensecret/oh-my-opensecret.log"),
+    level: logCfg.level ?? "info",
+    // ~ 由 logger 的 resolvePath 统一展开，此处原样透传，避免两套实现分歧
+    file: logCfg.file ?? "~/.oh-my-opensecret/oh-my-opensecret.log",
     maxSize: rotCfg.max_size ?? "10m",
     maxFiles: rotCfg.max_files ?? 7,
   }
   const autoDiscovery = cfg.auto_discovery !== false
-  const prefix = typeof cfg.placeholder_prefix === "string" && cfg.placeholder_prefix
-    ? cfg.placeholder_prefix
-    : "__OMOS_"
+  const prefix = cfg.placeholder_prefix ?? "__OMOS_"
 
   const session = cfg.session && typeof cfg.session === "object" ? cfg.session : {}
-  const ttlMs = parseDurationMs(session.ttl)
-  const maxMappings = Number.isFinite(session.max_mappings) && session.max_mappings > 0
-    ? Number(session.max_mappings)
-    : 100000
+  const ttlMs = parseDurationMs(session.ttl, "session.ttl")
+  const maxMappings = session.max_mappings ?? 100000
 
   const patterns = cfg.patterns && typeof cfg.patterns === "object" ? cfg.patterns : {}
 
@@ -305,7 +354,38 @@ patterns:
 `
 }
 
+// ---- 原子写入 ----
+
+/**
+ * 以 tmp + rename 方式写文件，避免并发进程互相抢文件、以及写一半留下损坏文件。
+ * @param {string} targetPath
+ * @param {string} content
+ */
+async function writeFileAtomic(targetPath, content) {
+  const tmpPath = `${targetPath}.${process.pid}.${Date.now()}.tmp`
+  try {
+    await fs.writeFile(tmpPath, content, "utf8")
+    await fs.rename(tmpPath, targetPath)
+  } catch (err) {
+    await fs.rm(tmpPath, { force: true })
+    throw new Error(`写入文件失败: ${targetPath} — ${err.message}`)
+  }
+}
+
 // ---- 配置查找 ----
+
+/**
+ * 获取 OpenCode 的全局配置目录。
+ * 与宿主保持一致：OPENCODE_CONFIG_DIR 优先，其次 XDG_CONFIG_HOME，最后 ~/.config。
+ * @returns {string}
+ */
+function globalOpencodeConfigDir() {
+  const envDir = process.env.OPENCODE_CONFIG_DIR
+  if (envDir) return path.resolve(String(envDir))
+  const xdg = process.env.XDG_CONFIG_HOME
+  if (xdg) return path.join(String(xdg), "opencode")
+  return path.join(os.homedir(), ".config", "opencode")
+}
 
 /**
  * 获取配置候选路径列表。
@@ -314,23 +394,23 @@ patterns:
  */
 export function getConfigCandidates(directory) {
   const dir = String(directory ?? process.cwd())
-  const home = os.homedir()
 
   const envPath = process.env[ENV_CONFIG_PATH]
-  const projectRoot = path.join(dir, CONFIG_FILENAME)
-  const projectLocal = path.join(dir, ".opencode", CONFIG_FILENAME)
-
   if (envPath) {
-    // 环境变量精确指定，不搜索全局路径
-    return [path.resolve(dir, envPath), projectRoot, projectLocal]
+    // 环境变量为显式指定：只认该路径，找不到即视为无配置，不静默回落到其它位置
+    return [path.resolve(dir, envPath)]
   }
 
-  const globalConfig = path.join(home, ".config", "opencode", CONFIG_FILENAME)
-  return [projectRoot, projectLocal, globalConfig]
+  return [
+    path.join(dir, CONFIG_FILENAME),
+    path.join(dir, ".opencode", CONFIG_FILENAME),
+    path.join(globalOpencodeConfigDir(), CONFIG_FILENAME),
+  ]
 }
 
 /**
  * 查找并加载配置文件。
+ * 文件不存在属正常情况（继续下一个候选）；文件存在但读取/解析失败必须抛错。
  * @param {string} directory
  * @returns {Promise<{ filepath: string, raw: any }|null>}
  */
@@ -339,15 +419,15 @@ async function findAndReadConfig(directory) {
   for (const filepath of candidates) {
     if (!filepath) continue
     if (!existsSync(filepath)) continue
-    try {
-      const content = await fs.readFile(filepath, "utf8")
-      const raw = yaml.load(content)
-      if (raw && typeof raw === "object") {
-        return { filepath, raw }
-      }
-    } catch {
-      continue
+
+    const content = await fs.readFile(filepath, "utf8")
+    const raw = yaml.load(content)
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+      return { filepath, raw }
     }
+    throw new Error(
+      `配置文件内容必须是 YAML 映射（key: value），实际解析为 ${typeName(raw)}: ${filepath}`,
+    )
   }
   return null
 }
@@ -360,7 +440,7 @@ async function findAndReadConfig(directory) {
  * @returns {Promise<object|null>}
  */
 async function readOpencodeConfig(directory) {
-  const home = os.homedir()
+  const globalDir = globalOpencodeConfigDir()
   const candidates = [
     // 本地项目
     path.join(directory, "opencode.json"),
@@ -368,15 +448,18 @@ async function readOpencodeConfig(directory) {
     path.join(directory, ".opencode", "opencode.json"),
     path.join(directory, ".opencode", "opencode.jsonc"),
     // 全局 Opencode 配置
-    path.join(home, ".config", "opencode", "opencode.json"),
-    path.join(home, ".config", "opencode", "opencode.jsonc"),
+    path.join(globalDir, "opencode.json"),
+    path.join(globalDir, "opencode.jsonc"),
   ]
   for (const filepath of candidates) {
     if (!existsSync(filepath)) continue
+    // 文件存在但读不出/解析不了必须抛错：静默跳过后会漏扫密钥，
+    // 新规则不会生成，明文密钥将直接进入 LLM 请求
+    const content = await fs.readFile(filepath, "utf8")
+    let parsed
     try {
-      const content = await fs.readFile(filepath, "utf8")
-      // 先试纯 JSON 解析（快且不受 regex 副作用影响）
-      try { return JSON.parse(content) } catch { /* fall through to JSONC stripping */ }
+      parsed = JSON.parse(content)
+    } catch {
       // JSONC: 用 placeholder 保护字符串内容，再剥离注释
       const strBucket = []
       const masked = content.replace(/"([^"\\]|\\.)*"/g, (m) => {
@@ -387,26 +470,40 @@ async function readOpencodeConfig(directory) {
         .replace(/\/\/.*$/gm, "")
         .replace(/\/\*[\s\S]*?\*\//g, "")
         .replace(/__JSONC_STR_(\d+)__/g, (_, i) => strBucket[+i])
-      return JSON.parse(stripped)
-    } catch {
-      continue
+      try {
+        parsed = JSON.parse(stripped)
+      } catch (err) {
+        throw new Error(`opencode 配置解析失败: ${filepath} — ${err.message}`)
+      }
     }
+    return parsed
   }
   return null
 }
 
 // ---- 自动发现 API Key ----
 
+/** 扫描报告块的首行与末行，作为按行定位的锚点 */
+const REPORT_HEADER = "# ======== auto-discovered: 扫描报告 ========"
+const REPORT_FOOTER = "# ========================================="
+const REPORT_HEADER_RE = /^# ======== auto-discovered: 扫描报告/
+
+/**
+ * 敏感字段名（全部小写）。匹配时对配置 key 做 toLowerCase() 后比对，
+ * 以覆盖 API_KEY / ApiKey / AUTHORIZATION 等大小写变体。
+ */
 const SENSITIVE_KEYS = new Set([
-  "apiKey", "apikey", "api_key", "api-key",
-  "secret", "secretKey", "secret_key", "secret-key",
-  "token", "accessToken", "access_token", "access-token",
+  "apikey", "api_key", "api-key",
+  "secret", "secretkey", "secret_key", "secret-key",
+  "token", "accesstoken", "access_token", "access-token",
+  "authtoken", "auth_token", "auth-token",
+  "refreshtoken", "refresh_token", "refresh-token",
+  "authorization", "bearer", "credentials", "dsn",
   "password", "passwd",
-  "privateKey", "private_key", "private-key",
-  "appSecret", "app_secret", "app-secret",
-  "clientSecret", "client_secret", "client-secret",
-  "authToken", "auth_token", "auth-token",
-  "refreshToken", "refresh_token", "refresh-token",
+  "privatekey", "private_key", "private-key",
+  "appsecret", "app_secret", "app-secret",
+  "clientsecret", "client_secret", "client-secret",
+  "clientkey", "client_key", "client-key",
 ])
 
 /**
@@ -430,11 +527,16 @@ function collectSensitiveValues(obj, prefix = "") {
   for (const [key, value] of Object.entries(obj)) {
     const fullPath = prefix ? `${prefix}.${key}` : key
 
-    if (typeof value === "string" && value.length >= 8 && SENSITIVE_KEYS.has(key)) {
+    if (typeof value === "string" && value.length >= 8 && SENSITIVE_KEYS.has(key.toLowerCase())) {
       if (!isPlaceholder(value)) {
         results.push({ path: fullPath, value })
       }
-    } else if (value && typeof value === "object" && !Array.isArray(value)) {
+    } else if (Array.isArray(value)) {
+      // 数组式 provider 配置（如 {"providers":[{"apiKey":"sk-..."}]}）同样要扫描
+      value.forEach((item, index) => {
+        results.push(...collectSensitiveValues(item, `${fullPath}[${index}]`))
+      })
+    } else if (value && typeof value === "object") {
       results.push(...collectSensitiveValues(value, fullPath))
     }
   }
@@ -447,51 +549,13 @@ function collectSensitiveValues(obj, prefix = "") {
  * @returns {Array<{ regex: RegExp, name: string, description: string, source: string }>}
  */
 function expandPatternsWithMeta(rawConfig) {
-  const rules = []
-
-  // 自定义正则
-  const custom = rawConfig?.patterns?.regex ?? []
-  for (const r of custom) {
-    const pat = String(r.pattern ?? "")
-    if (!pat) continue
-    try {
-      const parsed = parsePatternFlags(pat)
-      let flags = parsed.flags
-      if (!flags.includes("g")) flags = "g" + flags
-      const pid = r.placeholderId ?? r["placeholder-id"]
-      const name = pid ? String(pid).trim() : "custom"
-      rules.push({
-        regex: new RegExp(parsed.pattern, flags),
-        name,
-        description: name,
-        source: "custom",
-      })
-    } catch { /* skip */ }
-  }
-
-  // 内置规则
-  const builtinNames = rawConfig?.patterns?.builtin ?? []
-  for (const name of builtinNames) {
-    const key = String(name ?? "").trim()
-    if (!key) continue
-    const rule = BUILTIN.get(key)
-    if (!rule) continue
-    const pat = String(rule.pattern ?? "")
-    if (!pat) continue
-    try {
-      const parsed = parsePatternFlags(pat)
-      let flags = parsed.flags
-      if (!flags.includes("g")) flags = "g" + flags
-      rules.push({
-        regex: new RegExp(parsed.pattern, flags),
-        name: key,
-        description: rule.description || key,
-        source: "builtin",
-      })
-    } catch { /* skip */ }
-  }
-
-  return rules
+  // 与运行时脱敏共用 patterns.compileRegexRules，避免两处编译结果不一致
+  return compileRegexRules(rawConfig?.patterns).map((rule) => ({
+    regex: new RegExp(rule.pattern, rule.flags.includes("g") ? rule.flags : "g" + rule.flags),
+    name: rule.placeholderId,
+    description: rule.description,
+    source: rule.source,
+  }))
 }
 
 /**
@@ -528,12 +592,14 @@ function analyzeSensitiveValues(opencodeCfg, rawConfig) {
  * 2. 未找到则生成默认配置并写入
  * 3. 校验 schema
  * 4. 若 autoDiscovery 开启，扫描 Opencode 配置并自动追加规则
+ * 配置非法时抛错中止，不套默认值。
  * @param {string} directory 项目根目录
- * @param {{ info: Function, debug: Function }} [logger]
+ * @param {{ debug: Function, info: Function, warn: Function, error: Function }} [logger]
  * @returns {Promise<NormalizedConfig & { loadedFrom: string }>}
  */
 export async function loadConfig(directory, logger) {
-  const log = logger || { info: () => {}, debug: () => {} }
+  const noop = () => {}
+  const log = logger || { debug: noop, info: noop, warn: noop, error: noop }
 
   // 1. 查找配置文件
   const found = await findAndReadConfig(directory)
@@ -549,23 +615,23 @@ export async function loadConfig(directory, logger) {
     const envPath = process.env[ENV_CONFIG_PATH]
     const defaultPath = envPath
       ? path.resolve(directory, envPath)
-      : path.join(os.homedir(), ".config", "opencode", CONFIG_FILENAME)
+      : path.join(globalOpencodeConfigDir(), CONFIG_FILENAME)
     const defaultYaml = generateDefaultYaml()
-    await fs.writeFile(defaultPath, defaultYaml, "utf8")
+    await fs.mkdir(path.dirname(defaultPath), { recursive: true })
+    await writeFileAtomic(defaultPath, defaultYaml)
     log.info(`默认配置已生成: ${defaultPath}`)
 
-    const raw = yaml.load(defaultYaml)
-    rawConfig = raw
+    rawConfig = yaml.load(defaultYaml)
     configPath = defaultPath
   } else {
     rawConfig = found.raw
     configPath = found.filepath
   }
 
-  // 3. Schema 校验
-  const { valid, errors } = validateSchema(rawConfig)
-  if (!valid) {
-    log.warn(`配置校验告警:\n  ${errors.join("\n  ")}`)
+  // 3. Schema 校验：非法配置直接抛错中止，不套默认值
+  const errors = validateSchema(rawConfig)
+  if (errors.length > 0) {
+    throw new Error(`配置校验失败 (${configPath}):\n  - ${errors.join("\n  - ")}`)
   }
 
   // 4. 规范化
@@ -578,10 +644,18 @@ export async function loadConfig(directory, logger) {
       if (opencodeCfg) {
         const results = analyzeSensitiveValues(opencodeCfg, rawConfig)
         if (results.length > 0) {
-          const addedCount = await writeDiscoveryReport(configPath, rawConfig, results)
+          const newRules = await writeDiscoveryReport(configPath, rawConfig, results)
           const uncovered = results.filter((r) => !r.covered)
-          if (addedCount > 0) {
-            log.info(`自动发现: 生成 ${addedCount} 条新规则（共 ${results.length} 个敏感值，${results.length - uncovered.length} 已覆盖）`)
+          if (newRules.length > 0) {
+            // 新规则必须立即对当前进程生效，而不只是落盘。
+            // 报告已把这些值判定为「已覆盖、无需额外操作」，若 cfg.patterns 里没有它们，
+            // 这些密钥会以明文进入本次会话的 LLM 请求，与报告结论直接矛盾。
+            const regexList = Array.isArray(cfg.patterns.regex) ? cfg.patterns.regex : []
+            for (const rule of newRules) {
+              regexList.push({ pattern: rule.pattern, placeholderId: rule.id })
+            }
+            cfg.patterns.regex = regexList
+            log.info(`自动发现: 生成 ${newRules.length} 条新规则（共 ${results.length} 个敏感值，${results.length - uncovered.length} 已覆盖）`)
           } else if (uncovered.length > 0) {
             log.info(`自动发现: 共 ${results.length} 个敏感值（${results.length - uncovered.length} 已覆盖，${uncovered.length} 未覆盖，规则已存在跳过）`)
           } else {
@@ -590,7 +664,8 @@ export async function loadConfig(directory, logger) {
         }
       }
     } catch (err) {
-      log.warn(`自动发现失败: ${err.message}`)
+      // 规则未落盘意味着新发现的密钥可能以明文进入 LLM，必须暴露出来
+      log.error(`自动发现失败，本次新增规则未写入配置文件: ${err.message}`)
     }
   }
 
@@ -639,10 +714,10 @@ function generatePattern(value) {
  * @param {string} configPath
  * @param {object} rawConfig 原始配置对象（用于检查已有规则）
  * @param {Array<{ path: string, covered: boolean, ruleName: string|null, ruleDescription: string|null, value: string }>} results
- * @returns {Promise<number>} 新增规则数
+ * @returns {Promise<Array<{path: string, id: string, pattern: string}>>} 本次新增的规则，供调用方注入当前进程
  */
 async function writeDiscoveryReport(configPath, rawConfig, results) {
-  if (results.length === 0) return 0
+  if (results.length === 0) return []
 
   // ---- 1. 生成新规则 ----
   const existingIds = new Set(
@@ -684,11 +759,13 @@ async function writeDiscoveryReport(configPath, rawConfig, results) {
       const valIndent = itemIndent + "  "                     // 属性值缩进（如 "      "）
 
       // 按 YAML 列表缩进生成新规则文本
+      // pattern 用 JSON.stringify 转义：YAML 双引号标量兼容 JSON 转义，
+      // 密钥前 4 字符含 " 或 \ 时手写引号会产出非法 YAML
       const newLines = []
       for (const nr of newRules) {
         newLines.push(`${itemIndent}# auto-generated for: opencode.json → ${nr.path}`)
-        newLines.push(`${itemIndent}- pattern: "${nr.pattern}"`)
-        newLines.push(`${valIndent}placeholder-id: "${nr.id}"`)
+        newLines.push(`${itemIndent}- pattern: ${JSON.stringify(nr.pattern)}`)
+        newLines.push(`${valIndent}placeholder-id: ${JSON.stringify(nr.id)}`)
       }
 
       if (/^\s*regex:\s*\[\]\s*$/.test(lines[regexIdx])) {
@@ -721,17 +798,17 @@ async function writeDiscoveryReport(configPath, rawConfig, results) {
   }
 
   // 过滤出报告中尚未记录的条目
+  const formatReportLine = ({ path, value, covered, ruleName, ruleDescription }) => {
+    if (covered) {
+      const desc = ruleDescription || ruleName || "?"
+      return `#   [${path}]  ✅  已匹配 ${desc}`
+    }
+    // 绝不写入原文片段（配置文件通常会被提交 git），只提示 key 名与长度
+    return `#   [${path}]  ❌  未覆盖，长度 ${String(value ?? "").length} 字符`
+  }
   const newReportLines = results
     .filter((r) => !existingReportPaths.has(r.path))
-    .map(({ path, value, covered, ruleName, ruleDescription }) => {
-      const val = String(value ?? "")
-      if (covered) {
-        const desc = ruleDescription || ruleName || "?"
-        return `#   [${path}]  ✅  已匹配 ${desc}`
-      }
-      const prefix = val.length > 8 ? val.slice(0, 6) + "..." : val
-      return `#   [${path}]  ❌  以 "${prefix}" 开头，约 ${val.length} 字符`
-    })
+    .map(formatReportLine)
 
   if (newReportLines.length > 0) {
     // 更新已有报告的头部/尾部信息（重新统计）
@@ -740,69 +817,62 @@ async function writeDiscoveryReport(configPath, rawConfig, results) {
       ? "为未覆盖的值添加对应 pattern（无需暴露原文），重启 Opencode 后自动消除。"
       : "所有敏感值均已被覆盖，无需额外操作。"
 
-    const hasExistingReport = /# ======== auto-discovered: 扫描报告/.test(yamlContent)
+    const lines = yamlContent.split("\n")
+    const headerIdx = lines.findIndex((l) => REPORT_HEADER_RE.test(l))
 
-    if (!hasExistingReport) {
+    if (headerIdx < 0) {
       // 首次写入：整份报告插入到 patterns: 前面
-      const allLines = results.map(({ path, value, covered, ruleName, ruleDescription }) => {
-        const val = String(value ?? "")
-        if (covered) {
-          const desc = ruleDescription || ruleName || "?"
-          return `#   [${path}]  ✅  已匹配 ${desc}`
-        }
-        const prefix = val.length > 8 ? val.slice(0, 6) + "..." : val
-        return `#   [${path}]  ❌  以 "${prefix}" 开头，约 ${val.length} 字符`
-      })
-
       const comment = [
-        "# ======== auto-discovered: 扫描报告 ========",
+        REPORT_HEADER,
         `# 以下是从 opencode.json 中发现的敏感值（共 ${results.length} 个）：`,
         "#",
-        ...allLines,
+        ...results.map(formatReportLine),
         "#",
         `# 概要: ${results.length - uncovered.length} 个已覆盖 · ${uncovered.length} 个未覆盖`,
         `# ${footer}`,
-        "# =========================================",
+        REPORT_FOOTER,
       ].join("\n")
 
-      yamlContent = yamlContent.replace(
-        /^patterns:/m,
-        `${comment}\npatterns:`,
-      )
+      const patternsIdx = lines.findIndex((l) => /^patterns:/.test(l))
+      if (patternsIdx < 0) {
+        throw new Error(`配置文件缺少 patterns: 字段，无法写入自动发现报告: ${configPath}`)
+      }
+      lines.splice(patternsIdx, 0, comment)
     } else {
-      // 已有报告：在尾部标记前追加新条目，并更新统计信息
-      const insertBefore = "# ========================================="
-      const newBlock = [
-        ...newReportLines,
-      ].join("\n")
+      // 已有报告：按行定位，追加新条目到概要行之前，并就地更新统计行。
+      // 不用分隔线字符串做锚点——文件头的分隔线更长且包含该子串，
+      // String.replace 只会替换首处，会把报告插进文件头并逐轮上移。
+      const from = headerIdx + 1
+      const findInReport = (re) => {
+        for (let i = from; i < lines.length; i++) {
+          if (re.test(lines[i])) return i
+        }
+        return -1
+      }
 
-      // 追加新条目到报告末尾（在分隔线之前）
-      yamlContent = yamlContent.replace(
-        insertBefore,
-        `${newBlock}\n${insertBefore}`,
-      )
+      const totalIdx = findInReport(/^# 以下是从 opencode\.json 中发现的敏感值（共 \d+ 个）：$/)
+      if (totalIdx >= 0) {
+        lines[totalIdx] = `# 以下是从 opencode.json 中发现的敏感值（共 ${results.length} 个）：`
+      }
 
-      // 更新概要行
-      yamlContent = yamlContent.replace(
-        /^# 概要: .+$/m,
-        `# 概要: ${results.length - uncovered.length} 个已覆盖 · ${uncovered.length} 个未覆盖`,
-      )
-      yamlContent = yamlContent.replace(
-        /^# (所有敏感值均已被覆盖|为未覆盖的值添加对应 pattern).+$/m,
-        `# ${footer}`,
-      )
+      const summaryIdx = findInReport(/^# 概要: /)
+      if (summaryIdx < 0) {
+        throw new Error(`自动发现报告缺少「概要」行，报告块已损坏，请手动删除该注释块: ${configPath}`)
+      }
+      lines.splice(summaryIdx, 0, ...newReportLines)
+      lines[summaryIdx + newReportLines.length] =
+        `# 概要: ${results.length - uncovered.length} 个已覆盖 · ${uncovered.length} 个未覆盖`
 
-      // 更新总数行
-      yamlContent = yamlContent.replace(
-        /^# 以下是从 opencode\.json 中发现的敏感值（共 \d+ 个）：$/m,
-        `# 以下是从 opencode.json 中发现的敏感值（共 ${results.length} 个）：`,
-      )
+      const footerIdx = findInReport(/^# (所有敏感值均已被覆盖|为未覆盖的值添加对应 pattern)/)
+      if (footerIdx >= 0) {
+        lines[footerIdx] = `# ${footer}`
+      }
     }
+
+    yamlContent = lines.join("\n")
   }
 
-  const tmpPath = configPath + ".tmp"
-  await fs.writeFile(tmpPath, yamlContent, "utf8")
-  await fs.rename(tmpPath, configPath)
+  await writeFileAtomic(configPath, yamlContent)
 
-  return newRules.length
+  return newRules
 }

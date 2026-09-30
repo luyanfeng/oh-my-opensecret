@@ -10,7 +10,8 @@ function sanitizeCategory(input) {
 /**
  * 会话内占位符映射管理器。
  *
- * 占位符格式：`#{PREFIX}_{CATEGORY}_{hash12}__`
+ * 占位符格式：`{PREFIX}_{CATEGORY}_{hash12}__`，hash12 碰撞时为 `{PREFIX}_{CATEGORY}_{hash12}_N__`
+ * - CATEGORY 经 sanitizeCategory 清洗，允许含 `_`（如 `DB_CONNECTION`）
  * - hash12 = HMAC-SHA256(会话随机 secret, 原文) 前 12 位 hex
  * - 同一会话内同一原文 → 同一占位符（稳定可逆）
  * - 对上游 provider 不可逆
@@ -50,9 +51,11 @@ export class PlaceholderSession {
   }
 
   /**
-   * 淘汰最早的一条映射（当超过 maxMappings 时）。
+   * 淘汰最久未使用的一条映射（LRU）。
+   * `created` 记录的是最近一次命中/创建时间（见 lookup / lookupReverse），
+   * 因此时间戳最小者即最久未使用者。
    */
-  evictOldest() {
+  evictLeastRecentlyUsed() {
     let oldestPlaceholder = ""
     let oldestTime = Infinity
     for (const [placeholder, createdAt] of this.created) {
@@ -69,21 +72,25 @@ export class PlaceholderSession {
   }
 
   /**
-   * 通过占位符查找原文。
+   * 通过占位符查找原文。命中时刷新最近使用时间（LRU 排序 + TTL 滑动续期）。
    * @param {string} placeholder
    * @returns {string|undefined}
    */
   lookup(placeholder) {
-    return this.forward.get(placeholder)
+    const original = this.forward.get(placeholder)
+    if (original !== undefined) this.created.set(placeholder, Date.now())
+    return original
   }
 
   /**
-   * 通过原文查找占位符。
+   * 通过原文查找占位符。命中时刷新最近使用时间（LRU 排序 + TTL 滑动续期）。
    * @param {string} original
    * @returns {string|undefined}
    */
   lookupReverse(original) {
-    return this.reverse.get(original)
+    const placeholder = this.reverse.get(original)
+    if (placeholder !== undefined) this.created.set(placeholder, Date.now())
+    return placeholder
   }
 
   /**
@@ -115,7 +122,7 @@ export class PlaceholderSession {
     this.cleanup(now)
 
     if (Number.isFinite(this.maxMappings) && this.maxMappings > 0) {
-      while (this.forward.size >= this.maxMappings) this.evictOldest()
+      while (this.forward.size >= this.maxMappings) this.evictLeastRecentlyUsed()
     }
 
     const base = this.generatePlaceholder(original, placeholderId)
@@ -130,9 +137,8 @@ export class PlaceholderSession {
     }
 
     if (prev === original) {
-      // 已存在且一致，更新时间戳
-      this.created.set(base, now)
-      return base
+      // forward/reverse 必须一一对应：reverse 已有该 original 时上面已提前返回
+      throw new Error(`[oh-my-opensecret] 双向映射不一致: ${base}`)
     }
 
     // 极低概率：hash12 冲突。追加 _N 后缀
@@ -147,8 +153,8 @@ export class PlaceholderSession {
         return candidate
       }
       if (existing === original) {
-        this.created.set(candidate, now)
-        return candidate
+        // 同上：该 original 已由 reverse 指向某个占位符，不应在此处出现
+        throw new Error(`[oh-my-opensecret] 双向映射不一致: ${candidate}`)
       }
     }
   }
@@ -164,10 +170,16 @@ export class PlaceholderSession {
 
 /**
  * 构建匹配占位符的正则表达式。
+ *
+ * 类别段必须用非贪婪匹配：sanitizeCategory 允许类别含 `_`（如 `DB_CONNECTION`），
+ * 贪婪匹配会把相邻的两个占位符合并成一个 token，导致还原查表落空、占位符原样透出。
+ * 非贪婪下从占位符起点得到的第一个匹配即占位符自身的真实边界：
+ * 类别内部的 `_` 之后必然还跟 `_+hash12__`，其中含非 hex 的 `_`，
+ * 不可能凑出「12 位 hex + `__`」提前收尾。
  * @param {string} prefix 占位符前缀
  * @returns {RegExp}
  */
 export function getPlaceholderRegex(prefix) {
   const escaped = String(prefix).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-  return new RegExp(`${escaped}[A-Za-z0-9_]+_[a-f0-9]{12}(?:_\\d+)?__`, "g")
+  return new RegExp(`${escaped}[A-Za-z0-9_]+?_[a-f0-9]{12}(?:_\\d+)?__`, "g")
 }

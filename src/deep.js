@@ -9,39 +9,47 @@ function isPlainObject(value) {
 }
 
 /**
- * 深度遍历对象树，将所有字符串中的占位符还原为原文（原地修改）。
- * - 只遍历 Array / PlainObject
- * - 使用 WeakSet 避免循环引用
+ * 深度遍历对象树，将所有字符串中的占位符还原为原文，返回重建后的新树，不修改入参。
+ * - 非对象（string / number / null / undefined 等）原样返回，不做还原
+ * - Array / PlainObject 逐元素重建；其余类型（Date、类实例等）原样返回同一引用
+ * - 使用 WeakMap<原对象, 新副本> 避免循环引用，并保留共享结构
  * @param {unknown} value
  * @param {{ prefix: string, lookup(ph: string): string | undefined }} session
+ * @returns {unknown} 还原后的新树；无需还原时为原值
  */
 export function restoreDeep(value, session) {
-  const seen = new WeakSet()
+  if (!value || typeof value !== "object") return value
+
+  const seen = new WeakMap()
 
   const walk = (node) => {
-    if (!node || typeof node !== "object") return
-    if (seen.has(node)) return
-    seen.add(node)
+    if (!node || typeof node !== "object") return node
+    if (seen.has(node)) return seen.get(node)
 
     if (Array.isArray(node)) {
+      const copy = []
+      seen.set(node, copy)
       for (let i = 0; i < node.length; i++) {
         const v = node[i]
-        if (typeof v === "string") node[i] = restoreText(v, session)
-        if (v && typeof v === "object") walk(v)
+        copy[i] = typeof v === "string" ? restoreText(v, session) : v
+        if (v && typeof v === "object") copy[i] = walk(v)
       }
-      return
+      return copy
     }
 
-    if (!isPlainObject(node)) return
+    if (!isPlainObject(node)) return node
 
+    const copy = {}
+    seen.set(node, copy)
     for (const key of Object.keys(node)) {
       const v = node[key]
-      if (typeof v === "string") node[key] = restoreText(v, session)
-      if (v && typeof v === "object") walk(v)
+      copy[key] = typeof v === "string" ? restoreText(v, session) : v
+      if (v && typeof v === "object") copy[key] = walk(v)
     }
+    return copy
   }
 
-  walk(value)
+  return walk(value)
 }
 
 /**
