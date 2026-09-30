@@ -1,6 +1,7 @@
 import { describe, it, before, after, afterEach } from "node:test"
 import assert from "node:assert/strict"
 import crypto from "node:crypto"
+import yaml from "js-yaml"
 import * as fs from "node:fs/promises"
 import { existsSync } from "node:fs"
 import * as path from "node:path"
@@ -43,9 +44,43 @@ async function writeCfg(dir, extra = "") {
   )
 }
 
+/**
+ * 写入一份最小可用插件配置，但**开启** auto_discovery 且 patterns 全空，
+ * 供 auto-discovery 报告块的用例复用（writeCfg 关掉了 auto_discovery）。
+ */
+async function writeAutoDiscoveryCfg(cfgPath) {
+  await fs.writeFile(
+    cfgPath,
+    "enabled: true\nauto_discovery: true\npatterns:\n  keywords: []\n  regex: []\n  builtin: []\n  exclude: []\n",
+    "utf8",
+  )
+}
+
+/** 报告块的结束行（比配置文件自己的分隔线短一个 =） */
+const REPORT_FOOTER = "# ========================================="
+
 /** 报告块（注释行）中所有以 `[path]` 开头的数据行 */
 function reportEntries(content) {
   return content.split("\n").filter((l) => /^#\s+\[.+\]\s+[✅❌]/.test(l))
+}
+
+/**
+ * 报告块原文：从 header 行到结束行整段。
+ * 报告块内允许出现旧的/陈旧的条目，因此「某条路径是否还在报告里」只能在块内判断，
+ * 不能对整个文件做子串匹配——patterns.regex 里残留的 auto-generated 注释会带同样的路径。
+ */
+function reportBlock(content) {
+  const lines = content.split("\n")
+  const headerIdx = lines.findIndex((l) => l.includes("auto-discovered: 扫描报告"))
+  if (headerIdx < 0) return ""
+  const footerIdx = lines.findIndex((l, i) => i > headerIdx && l === REPORT_FOOTER)
+  return lines.slice(headerIdx, footerIdx < 0 ? undefined : footerIdx + 1).join("\n")
+}
+
+/** 解析报告块概要行；概要行缺失或格式不符时返回 null */
+function reportSummary(text) {
+  const m = text.match(/^# 概要: (\d+) 个已覆盖 · (\d+) 个未覆盖$/m)
+  return m ? { covered: Number(m[1]), uncovered: Number(m[2]) } : null
 }
 
 /** 断言 text 中不含 secret 的任何 minLen 长片段 */
@@ -467,6 +502,383 @@ describe("config.js", () => {
       )
       assertNoFragment(content, "alpha-secret-key-0001", "配置文件(alpha)", 8)
       assertNoFragment(content, "bravo-secret-key-0002", "配置文件(bravo)", 8)
+    })
+
+    // =============================================
+    // 报告块「每轮由本轮 results 整体重算重写」的回归用例
+    // 三个缺陷共有的根因：报告块内容本可完全由本轮 results 决定，
+    // 旧实现却靠「报告中是否已存在该路径」做增量追加，导致
+    // 已有路径的覆盖状态不刷新（缺陷 A）、概要统计与块内条目数脱节（缺陷 B）、
+    // 配置里已不存在的路径永久滞留（缺陷 C）。
+    // =============================================
+
+    it("覆盖状态会更新：路径不变、规则被删后同一条目由 ❌ 翻转为 ✅（缺陷 A）", async () => {
+      const dir = await makeTmpDir("discovery-status-flip")
+      const cfgPath = path.join(dir, "oh-my-opensecret.yaml")
+      // 与报告样板（opencode.json / apiKey / auto-generated …）无任何 3 字符公共片段
+      const key = "Wq4nZb7Ht3Kc9Mv"
+      await fs.writeFile(path.join(dir, "opencode.json"), JSON.stringify({ apiKey: key }), "utf8")
+      // 第一轮：用户已手写同 placeholder-id 的规则 → 派生规则被跳过 → 该值只能记 ❌
+      await fs.writeFile(
+        cfgPath,
+        "enabled: true\nauto_discovery: true\npatterns:\n" +
+          '  regex:\n    - { pattern: "existing-rule", placeholder-id: "APIKEY_KEY" }\n' +
+          "  keywords: []\n  builtin: []\n  exclude: []\n",
+        "utf8",
+      )
+
+      const { loadConfig } = await import("../src/config.js")
+      await loadConfig(dir, NOOP_LOGGER)
+
+      const content1 = await fs.readFile(cfgPath, "utf8")
+      const entry1 = reportEntries(content1).find((l) => l.includes("[apiKey]"))
+      assert.ok(entry1, "第一轮报告应有 apiKey 条目")
+      assert.ok(entry1.includes("❌"), `同 id 规则已存在时该值应记未覆盖: ${entry1}`)
+
+      // 用户随后手动删掉那条规则：报告块原样留在原处，regex 清空（路径本身没变）
+      await fs.writeFile(
+        cfgPath,
+        "enabled: true\nauto_discovery: true\n" + reportBlock(content1) + "\n" +
+          "patterns:\n  regex: []\n  keywords: []\n  builtin: []\n  exclude: []\n",
+        "utf8",
+      )
+
+      await loadConfig(dir, NOOP_LOGGER)
+      const content2 = await fs.readFile(cfgPath, "utf8")
+      const entries2 = reportEntries(content2)
+      const entry2 = entries2.find((l) => l.includes("[apiKey]"))
+      assert.ok(entry2, "第二轮报告仍应有 apiKey 条目")
+      // 关键断言：路径已存在于报告、只是覆盖状态变了 → 那一条必须被改写，而不是保持原样
+      assert.ok(entry2.includes("✅"), `规则补齐后同一条目应翻转为已覆盖: ${entry2}`)
+      // 状态翻转只能就地改写，不得靠追加产生第二行
+      assert.equal(entries2.length, 1, `同一路径只应有一条报告条目: ${JSON.stringify(entries2)}`)
+      assert.deepEqual(reportSummary(content2), { covered: 1, uncovered: 0 })
+      assertNoFragment(reportBlock(content2), key, "报告块(状态翻转)", 3)
+    })
+
+    it("概要统计与报告块实际条目数一致（缺陷 B）", async () => {
+      const dir = await makeTmpDir("discovery-summary")
+      const cfgPath = path.join(dir, "oh-my-opensecret.yaml")
+      await writeAutoDiscoveryCfg(cfgPath)
+
+      const { loadConfig } = await import("../src/config.js")
+      // 第一轮：路径形态为 provider.alpha.options.apiKey
+      await fs.writeFile(
+        path.join(dir, "opencode.json"),
+        JSON.stringify({ provider: { alpha: { options: { apiKey: "Wq4nZb7Ht3Kc9Mv" } } } }),
+        "utf8",
+      )
+      await loadConfig(dir, NOOP_LOGGER)
+
+      // 第二轮：用户改了配置结构，路径形态变成 providers.bravo.settings.apiKey
+      await fs.writeFile(
+        path.join(dir, "opencode.json"),
+        JSON.stringify({ providers: { bravo: { settings: { apiKey: "Hy8kLm3Pq7Rt5Wz" } } } }),
+        "utf8",
+      )
+      await loadConfig(dir, NOOP_LOGGER)
+
+      const block = reportBlock(await fs.readFile(cfgPath, "utf8"))
+      const entries = reportEntries(block)
+      const summary = reportSummary(block)
+      assert.ok(summary, `报告块必须含概要行: ${block}`)
+      // 概要里的两个数字之和必须能解释块内的实际条目数
+      assert.equal(
+        entries.length,
+        summary.covered + summary.uncovered,
+        `概要「${summary.covered} 已覆盖 + ${summary.uncovered} 未覆盖」与实际 ${entries.length} 条不符: ${block}`,
+      )
+      // 本轮只扫到 1 个敏感值，块内就必须只有 1 条
+      assert.equal(entries.length, 1, `报告块只应反映本轮结果: ${JSON.stringify(entries)}`)
+      assert.ok(entries[0].includes("[providers.bravo.settings.apiKey]"), `报告应只反映本轮路径: ${entries[0]}`)
+      // 首行的「共 N 个」同样必须与条目数一致
+      assert.match(block, new RegExp(`共 ${entries.length} 个`), `「共 N 个」与实际条目数不符: ${block}`)
+    })
+
+    it("配置里已不存在的路径，其陈旧报告条目必须被清除（缺陷 C）", async () => {
+      const dir = await makeTmpDir("discovery-stale")
+      const cfgPath = path.join(dir, "oh-my-opensecret.yaml")
+      await writeAutoDiscoveryCfg(cfgPath)
+
+      const { loadConfig } = await import("../src/config.js")
+      await fs.writeFile(
+        path.join(dir, "opencode.json"),
+        JSON.stringify({ provider: { alpha: { options: { apiKey: "Wq4nZb7Ht3Kc9Mv" } } } }),
+        "utf8",
+      )
+      await loadConfig(dir, NOOP_LOGGER)
+      assert.ok(
+        reportBlock(await fs.readFile(cfgPath, "utf8")).includes("provider.alpha.options.apiKey"),
+        "第一轮报告应含旧路径形态",
+      )
+
+      // 用户把 provider.alpha.options.apiKey 改名成 providers.bravo.settings.apiKey
+      // （provider 名也换掉，避免派生出的 placeholder-id 撞上第一轮的 ALPHA_KEY）
+      await fs.writeFile(
+        path.join(dir, "opencode.json"),
+        JSON.stringify({ providers: { bravo: { settings: { apiKey: "Hy8kLm3Pq7Rt5Wz" } } } }),
+        "utf8",
+      )
+      await loadConfig(dir, NOOP_LOGGER)
+
+      const block = reportBlock(await fs.readFile(cfgPath, "utf8"))
+      // 只在报告块内判断：patterns.regex 里残留的 auto-generated 规则注释不属于报告块
+      assert.ok(!block.includes("provider.alpha.options.apiKey"), `报告块残留旧路径: ${block}`)
+      assert.ok(
+        !reportEntries(block).some((l) => l.includes("alpha")),
+        `报告块残留旧条目: ${JSON.stringify(reportEntries(block))}`,
+      )
+      assert.equal(reportEntries(block).length, 1, `陈旧条目清除后只应剩 1 条: ${JSON.stringify(reportEntries(block))}`)
+      assert.ok(block.includes("[providers.bravo.settings.apiKey]"), `报告应含本轮路径: ${block}`)
+    })
+
+    it("同一输入连续三轮：报告块唯一、条目不增长、第 2/3 轮文件内容逐字一致", async () => {
+      const dir = await makeTmpDir("discovery-idempotent")
+      const cfgPath = path.join(dir, "oh-my-opensecret.yaml")
+      const header = "# ============================================"
+      const ownHeader = "# 这是配置文件自己的头部注释"
+      await fs.writeFile(
+        cfgPath,
+        `${header}\n${ownHeader}\nenabled: true\nauto_discovery: true\n` +
+          "patterns:\n  keywords: []\n  regex: []\n  builtin: []\n  exclude: []\n",
+        "utf8",
+      )
+      await fs.writeFile(
+        path.join(dir, "opencode.json"),
+        JSON.stringify({
+          providers: {
+            one: { apiKey: "Wq4nZb7Ht3Kc9Mv" },
+            two: { token: "Hy8kLm3Pq7Rt5Wz" },
+          },
+        }),
+        "utf8",
+      )
+
+      const { loadConfig } = await import("../src/config.js")
+      const snaps = []
+      for (let round = 1; round <= 3; round++) {
+        await loadConfig(dir, NOOP_LOGGER)
+        snaps.push(await fs.readFile(cfgPath, "utf8"))
+      }
+
+      // 第 1 轮派生规则尚未落盘，条目描述只能写 "auto-generated: <path>"；
+      // 第 2 轮规则已在文件里、整体重算后描述改指真实规则 id，此后必须完全稳定。
+      assert.equal(
+        snaps[1],
+        snaps[2],
+        `第 2/3 轮文件内容必须逐字一致:\n--- 第 2 轮 ---\n${snaps[1]}\n--- 第 3 轮 ---\n${snaps[2]}`,
+      )
+
+      for (const [index, snap] of snaps.entries()) {
+        const round = index + 1
+        const lines = snap.split("\n")
+        assert.equal(
+          lines.filter((l) => l.includes("auto-discovered: 扫描报告")).length,
+          1,
+          `第 ${round} 轮：扫描报告块只能有一个`,
+        )
+        assert.equal(lines.filter((l) => l === REPORT_FOOTER).length, 1, `第 ${round} 轮：报告结束行只能有一个`)
+        assert.equal(reportEntries(snap).length, 2, `第 ${round} 轮：条目数必须是 2，不得增长`)
+        assert.equal(lines[0], header, `第 ${round} 轮：文件头分隔线不得被报告块挤掉`)
+        assert.equal(lines[1], ownHeader, `第 ${round} 轮：用户头部注释必须留在原位`)
+        assert.deepEqual(reportSummary(snap), { covered: 2, uncovered: 0 }, `第 ${round} 轮：概要与条目必须一致`)
+      }
+      assert.equal(
+        snaps[2].split("\n").filter((l) => l.includes("# auto-generated for:")).length,
+        2,
+        "派生规则注释不得重复追加",
+      )
+      assertNoFragment(reportBlock(snaps[2]), "Wq4nZb7Ht3Kc9Mv", "报告块(幂等-one)", 3)
+      assertNoFragment(reportBlock(snaps[2]), "Hy8kLm3Pq7Rt5Wz", "报告块(幂等-two)", 3)
+    })
+
+    it("报告块整体重写不得破坏用户配置（手写规则 / builtin / exclude / 其它段）", async () => {
+      const dir = await makeTmpDir("discovery-preserve")
+      const cfgPath = path.join(dir, "oh-my-opensecret.yaml")
+      // 报告块只能插在 patterns: 之前 → patterns: 之前的整段必须是逐字不变的用户内容
+      const userHead = [
+        "# ============================================",
+        "# 用户自己的配置头部注释",
+        "enabled: true",
+        "auto_discovery: true",
+        "logging:",
+        '  level: "info"',
+        "session:",
+        '  ttl: "2h"',
+        "",
+      ].join("\n")
+      const userPatterns = [
+        "patterns:",
+        '  keywords: ["password"]',
+        "  regex:",
+        '    - { pattern: "/own-[a-z0-9]{4}/", placeholder-id: "OWN_MANUAL" }',
+        '  builtin: ["email", "uuid"]',
+        "  exclude:",
+        '    - "**/fixtures/*"',
+        '    - "src/**/*.test.js"',
+        "",
+      ].join("\n")
+      await fs.writeFile(cfgPath, userHead + userPatterns, "utf8")
+      await fs.writeFile(
+        path.join(dir, "opencode.json"),
+        JSON.stringify({ providers: { bravo: { settings: { apiKey: "Wq4nZb7Ht3Kc9Mv" } } } }),
+        "utf8",
+      )
+
+      const { loadConfig } = await import("../src/config.js")
+      let content = ""
+      for (let round = 1; round <= 3; round++) {
+        await loadConfig(dir, NOOP_LOGGER)
+        content = await fs.readFile(cfgPath, "utf8")
+        assert.ok(content.startsWith(userHead), `第 ${round} 轮：patterns: 之前的用户配置必须逐字未变:\n${content}`)
+      }
+
+      // 用户写下的每一行都只能保留一份（既不能丢，也不能被复制）
+      for (const line of userPatterns.split("\n").filter((l) => l.trim() !== "")) {
+        const count = content.split("\n").filter((l) => l === line).length
+        assert.equal(count, 1, `用户配置行必须原样保留且不重复: ${line}`)
+      }
+
+      // 语义层面同样未被破坏
+      const parsed = yaml.load(content)
+      assert.deepEqual(parsed.patterns.exclude, ["**/fixtures/*", "src/**/*.test.js"], "exclude 列表被改写")
+      assert.deepEqual(parsed.patterns.builtin, ["email", "uuid"], "builtin 列表被改写")
+      assert.deepEqual(parsed.patterns.keywords, ["password"], "keywords 列表被改写")
+      assert.deepEqual(
+        parsed.patterns.regex.find((r) => r["placeholder-id"] === "OWN_MANUAL"),
+        { pattern: "/own-[a-z0-9]{4}/", "placeholder-id": "OWN_MANUAL" },
+        "用户手写规则被改写",
+      )
+      assert.equal(parsed.session.ttl, "2h", "session 段被改写")
+      assert.equal(parsed.logging.level, "info", "logging 段被改写")
+    })
+
+    it("报告块「概要」行被删后应自愈重建（概要是生成内容，不是块边界锚点）", async () => {
+      // 为什么概要行缺失不算损坏：报告块的内容完全由本轮扫描结果决定，每轮由 results
+      // 整体重算并整体替换，块边界只认 header 与结束行两行。概要行是渲染出来的
+      // 统计文本，删掉它下一轮就会被重新生成，块结构与统计一致性都能自行恢复。
+      // 真正的损坏是「边界行」缺失（见下一个用例：结束行被删），那种情况无法确定
+      // 块的范围，必须抛错而不是猜位置重写。
+      const dir = await makeTmpDir("discovery-missing-summary")
+      const cfgPath = path.join(dir, "oh-my-opensecret.yaml")
+      await writeAutoDiscoveryCfg(cfgPath)
+      await fs.writeFile(
+        path.join(dir, "opencode.json"),
+        JSON.stringify({ providers: { solo: { apiKey: "Wq4nZb7Ht3Kc9Mv" } } }),
+        "utf8",
+      )
+
+      const { loadConfig } = await import("../src/config.js")
+      await loadConfig(dir, NOOP_LOGGER)
+
+      // 手工破坏：只删掉「概要」行，header 与结束行都保留
+      const broken = (await fs.readFile(cfgPath, "utf8"))
+        .split("\n")
+        .filter((l) => !/^# 概要: /.test(l))
+        .join("\n")
+      assert.equal(reportEntries(broken).length, 1, "破坏前报告块应有一条目")
+      assert.ok(broken.includes("auto-discovered: 扫描报告"), "破坏后 header 应仍在")
+      assert.ok(broken.includes(REPORT_FOOTER), "破坏后结束行应仍在")
+      assert.equal(reportSummary(broken), null, "破坏后概要行应缺失")
+      await fs.writeFile(cfgPath, broken, "utf8")
+
+      const errors = []
+      const logger = { debug() {}, info() {}, warn() {}, error(m) { errors.push(String(m)) } }
+      let thrown = null
+      try {
+        await loadConfig(dir, logger)
+      } catch (err) {
+        thrown = err
+      }
+      // 块边界完整 → 不构成损坏，必须正常加载而不是抛错
+      assert.equal(
+        thrown,
+        null,
+        `边界行完整时不得抛错，实际: ${thrown?.message}；错误日志: ${JSON.stringify(errors)}`,
+      )
+      assert.deepEqual(errors, [], "未失败却记了 error 日志，属于静默降级")
+
+      const content = await fs.readFile(cfgPath, "utf8")
+      const lines = content.split("\n")
+      const block = reportBlock(content)
+      // 概要行被重新渲染，且格式与内容都由本轮 results 决定
+      assert.deepEqual(
+        reportSummary(block),
+        { covered: 1, uncovered: 0 },
+        `概要行未被正确重建: ${block}`,
+      )
+      assert.equal(
+        lines.filter((l) => l.startsWith("# 概要")).length,
+        1,
+        `概要行必须恰好重建一条: ${block}`,
+      )
+      assert.ok(
+        block.includes("# 概要: 1 个已覆盖 · 0 个未覆盖"),
+        `概要行格式不符: ${block}`,
+      )
+      // 块结构完整：header / 结束行各一份，没有因重写而复制或丢失
+      assert.equal(
+        lines.filter((l) => l.includes("auto-discovered: 扫描报告")).length,
+        1,
+        `header 必须恰好一份: ${content}`,
+      )
+      assert.equal(
+        lines.filter((l) => l === REPORT_FOOTER).length,
+        1,
+        `结束行必须恰好一份: ${content}`,
+      )
+      // 概要数字之和必须能解释块内实际条目数（重建不是拼贴，统计要自洽）
+      const entries = reportEntries(block)
+      const summary = reportSummary(block)
+      assert.equal(
+        entries.length,
+        summary.covered + summary.uncovered,
+        `概要「${summary.covered} 已覆盖 + ${summary.uncovered} 未覆盖」与实际 ${entries.length} 条不符: ${block}`,
+      )
+      assert.equal(entries.length, 1, `报告块只应反映本轮结果: ${JSON.stringify(entries)}`)
+      assert.ok(entries[0].includes("[providers.solo.apiKey]"), `条目路径应为本轮扫描结果: ${entries[0]}`)
+      // 重建的是整块内容而不是补一行概要：再跑一轮，块应逐字稳定
+      await loadConfig(dir, NOOP_LOGGER)
+      assert.equal(
+        reportBlock(await fs.readFile(cfgPath, "utf8")),
+        block,
+        "自愈后的报告块应在下一轮保持稳定",
+      )
+    })
+
+    it("报告块损坏（结束行被删）时必须抛错，且不得半写文件（fail-fast）", async () => {
+      const dir = await makeTmpDir("discovery-broken-footer")
+      const cfgPath = path.join(dir, "oh-my-opensecret.yaml")
+      await writeAutoDiscoveryCfg(cfgPath)
+      await fs.writeFile(
+        path.join(dir, "opencode.json"),
+        JSON.stringify({ providers: { solo: { apiKey: "Wq4nZb7Ht3Kc9Mv" } } }),
+        "utf8",
+      )
+
+      const { loadConfig } = await import("../src/config.js")
+      await loadConfig(dir, NOOP_LOGGER)
+
+      // 手工破坏：删掉报告块的结束行 → 块边界无法确定，必须报错而不是猜位置重写
+      const broken = (await fs.readFile(cfgPath, "utf8"))
+        .split("\n")
+        .filter((l) => l !== REPORT_FOOTER)
+        .join("\n")
+      await fs.writeFile(cfgPath, broken, "utf8")
+
+      const errors = []
+      const logger = { debug() {}, info() {}, warn() {}, error(m) { errors.push(String(m)) } }
+      // 不用 assert.rejects 的第三个参数：它在 promise settle 之前求值，拿不到实际错误日志
+      let thrown = null
+      try {
+        await loadConfig(dir, logger)
+      } catch (err) {
+        thrown = err
+      }
+      assert.ok(thrown, `缺少结束行时必须抛错；实际捕获到的错误日志: ${JSON.stringify(errors)}`)
+      assert.match(thrown.message, /报告块已损坏|手动删除该注释块/)
+      // 抛错时不得留下半写状态
+      assert.equal(await fs.readFile(cfgPath, "utf8"), broken, "抛错后配置文件不得被改写")
     })
   })
 

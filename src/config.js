@@ -664,8 +664,11 @@ export async function loadConfig(directory, logger) {
         }
       }
     } catch (err) {
-      // 规则未落盘意味着新发现的密钥可能以明文进入 LLM，必须暴露出来
+      // 报告块损坏属于配置自身不可用，抛错中止加载，不能降级为记日志继续跑：
+      // 规则未落盘时新发现的密钥会以明文进入 LLM 请求，而报告仍停留在旧的
+      // 「✅ 已覆盖」状态，用户无从察觉。宁可启动失败也不要静默泄漏。
       log.error(`自动发现失败，本次新增规则未写入配置文件: ${err.message}`)
+      throw new Error(`自动发现失败，配置未生效: ${err.message}`, { cause: err })
     }
   }
 
@@ -788,16 +791,13 @@ async function writeDiscoveryReport(configPath, rawConfig, results) {
     }
   }
 
-  // 2b. 插入/更新扫描报告注释
-  // 先解析文件中已有的报告条目，按 path 索引
-  const existingReportPaths = new Set()
-  const reportLineRegex = /^#\s+\[([^\]]+)\]\s+([✅❌])\s+/
-  for (const line of yamlContent.split("\n")) {
-    const m = line.match(reportLineRegex)
-    if (m) existingReportPaths.add(m[1])
-  }
-
-  // 过滤出报告中尚未记录的条目
+  // 2b. 渲染/更新扫描报告注释
+  //
+  // 报告块的内容完全由本轮 results 决定，因此每轮整体重算并整体替换旧块，
+  // 不做增量追加。增量方案有三个无法收敛的问题：
+  //   - 覆盖状态永不更新：更新整块曾被「是否有新路径」守着，已有路径的 ✅/❌ 翻转不会反映
+  //   - 概要与实际条目数脱节：概要曾按本轮 results.length 统计，块内却可能累积历史条目
+  //   - 陈旧条目只增不减：配置里已不存在的路径（如 provider 改名）会永久留下且永不更新
   const formatReportLine = ({ path, value, covered, ruleName, ruleDescription }) => {
     if (covered) {
       const desc = ruleDescription || ruleName || "?"
@@ -806,67 +806,42 @@ async function writeDiscoveryReport(configPath, rawConfig, results) {
     // 绝不写入原文片段（配置文件通常会被提交 git），只提示 key 名与长度
     return `#   [${path}]  ❌  未覆盖，长度 ${String(value ?? "").length} 字符`
   }
-  const newReportLines = results
-    .filter((r) => !existingReportPaths.has(r.path))
-    .map(formatReportLine)
 
-  if (newReportLines.length > 0) {
-    // 更新已有报告的头部/尾部信息（重新统计）
-    const uncovered = results.filter((r) => !r.covered)
-    const footer = uncovered.length > 0
+  const uncovered = results.filter((r) => !r.covered)
+  const reportBlock = [
+    REPORT_HEADER,
+    `# 以下是从 opencode.json 中发现的敏感值（共 ${results.length} 个）：`,
+    "#",
+    ...results.map(formatReportLine),
+    "#",
+    `# 概要: ${results.length - uncovered.length} 个已覆盖 · ${uncovered.length} 个未覆盖`,
+    `# ${uncovered.length > 0
       ? "为未覆盖的值添加对应 pattern（无需暴露原文），重启 Opencode 后自动消除。"
-      : "所有敏感值均已被覆盖，无需额外操作。"
+      : "所有敏感值均已被覆盖，无需额外操作。"}`,
+    REPORT_FOOTER,
+  ]
 
+  {
     const lines = yamlContent.split("\n")
     const headerIdx = lines.findIndex((l) => REPORT_HEADER_RE.test(l))
 
     if (headerIdx < 0) {
-      // 首次写入：整份报告插入到 patterns: 前面
-      const comment = [
-        REPORT_HEADER,
-        `# 以下是从 opencode.json 中发现的敏感值（共 ${results.length} 个）：`,
-        "#",
-        ...results.map(formatReportLine),
-        "#",
-        `# 概要: ${results.length - uncovered.length} 个已覆盖 · ${uncovered.length} 个未覆盖`,
-        `# ${footer}`,
-        REPORT_FOOTER,
-      ].join("\n")
-
       const patternsIdx = lines.findIndex((l) => /^patterns:/.test(l))
       if (patternsIdx < 0) {
         throw new Error(`配置文件缺少 patterns: 字段，无法写入自动发现报告: ${configPath}`)
       }
-      lines.splice(patternsIdx, 0, comment)
+      lines.splice(patternsIdx, 0, ...reportBlock)
     } else {
-      // 已有报告：按行定位，追加新条目到概要行之前，并就地更新统计行。
-      // 不用分隔线字符串做锚点——文件头的分隔线更长且包含该子串，
-      // String.replace 只会替换首处，会把报告插进文件头并逐轮上移。
-      const from = headerIdx + 1
-      const findInReport = (re) => {
-        for (let i = from; i < lines.length; i++) {
-          if (re.test(lines[i])) return i
-        }
-        return -1
+      // 块内是纯生成内容，header 到 footer 整段替换。
+      // 边界只认 header/footer 两行，不用文件头的分隔线当锚点——
+      // 文件头分隔线更长且包含 REPORT_FOOTER 子串，按子串匹配会插错位置。
+      const footerIdx = lines.findIndex(
+        (l, i) => i > headerIdx && l === REPORT_FOOTER,
+      )
+      if (footerIdx < 0) {
+        throw new Error(`自动发现报告缺少结束行「${REPORT_FOOTER}」，报告块已损坏，请手动删除该注释块: ${configPath}`)
       }
-
-      const totalIdx = findInReport(/^# 以下是从 opencode\.json 中发现的敏感值（共 \d+ 个）：$/)
-      if (totalIdx >= 0) {
-        lines[totalIdx] = `# 以下是从 opencode.json 中发现的敏感值（共 ${results.length} 个）：`
-      }
-
-      const summaryIdx = findInReport(/^# 概要: /)
-      if (summaryIdx < 0) {
-        throw new Error(`自动发现报告缺少「概要」行，报告块已损坏，请手动删除该注释块: ${configPath}`)
-      }
-      lines.splice(summaryIdx, 0, ...newReportLines)
-      lines[summaryIdx + newReportLines.length] =
-        `# 概要: ${results.length - uncovered.length} 个已覆盖 · ${uncovered.length} 个未覆盖`
-
-      const footerIdx = findInReport(/^# (所有敏感值均已被覆盖|为未覆盖的值添加对应 pattern)/)
-      if (footerIdx >= 0) {
-        lines[footerIdx] = `# ${footer}`
-      }
+      lines.splice(headerIdx, footerIdx - headerIdx + 1, ...reportBlock)
     }
 
     yamlContent = lines.join("\n")
