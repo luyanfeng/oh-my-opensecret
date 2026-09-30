@@ -1,140 +1,639 @@
-import { describe, it, before, after } from "node:test"
+import { describe, it, before, after, afterEach } from "node:test"
 import assert from "node:assert/strict"
 import crypto from "node:crypto"
 import * as fs from "node:fs/promises"
+import { existsSync } from "node:fs"
 import * as path from "node:path"
 import os from "node:os"
 import { fileURLToPath } from "node:url"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const TMP = path.join(__dirname, "..", ".test-tmp")
+// 收敛到 .test-tmp/config 子目录：node --test 并行跑各测试文件，
+// 直接用 .test-tmp 根目录会在 after 里删掉其它文件正在使用的目录
+const TMP = path.join(__dirname, "..", ".test-tmp", "config")
 
-// 辅助：清理并创建临时目录
-async function setup(tmpDir) {
-  await fs.rm(tmpDir, { recursive: true, force: true })
-  await fs.mkdir(tmpDir, { recursive: true })
+/**
+ * 完整的 noop logger（4 级齐全）。
+ * loadConfig 的自动发现失败分支会调 log.error，只写 3 级的 mock 会崩：
+ * TypeError: log.error is not a function。
+ */
+const NOOP_LOGGER = { debug() {}, info() {}, warn() {}, error() {} }
+
+/** 所有用例创建的目录统一登记，after 里一次性清干净 */
+const createdDirs = []
+
+async function makeTmpDir(prefix) {
+  const dir = path.join(TMP, `${prefix}-${crypto.randomBytes(4).toString("hex")}`)
+  await fs.mkdir(dir, { recursive: true })
+  createdDirs.push(dir)
+  return dir
 }
 
-// 辅助：清理临时目录
-async function teardown(tmpDir) {
-  await fs.rm(tmpDir, { recursive: true, force: true })
+/**
+ * 写入一份最小可用插件配置（auto-discovery 关闭，避免 opencode.json 干扰）。
+ * extra 追加在 patterns: 之后（YAML 键序无关）。
+ */
+async function writeCfg(dir, extra = "") {
+  await fs.writeFile(
+    path.join(dir, "oh-my-opensecret.yaml"),
+    "enabled: true\nauto_discovery: false\n" +
+      "patterns:\n  keywords: []\n  regex: []\n  builtin: []\n  exclude: []\n" +
+      extra,
+    "utf8",
+  )
+}
+
+/** 报告块（注释行）中所有以 `[path]` 开头的数据行 */
+function reportEntries(content) {
+  return content.split("\n").filter((l) => /^#\s+\[.+\]\s+[✅❌]/.test(l))
+}
+
+/** 断言 text 中不含 secret 的任何 minLen 长片段 */
+function assertNoFragment(text, secret, label, minLen = 8) {
+  assert.ok(!text.includes(secret), `${label}: 不得残留完整原文`)
+  for (let i = 0; i + minLen <= secret.length; i++) {
+    const frag = secret.slice(i, i + minLen)
+    assert.ok(!text.includes(frag), `${label}: 残留原文片段 "${frag}"`)
+  }
 }
 
 describe("config.js", () => {
-  let testDir
+  let isoGlobalDir
+  let savedOpencodeConfigDir
+  let savedSecretConfig
 
   before(async () => {
-    testDir = path.join(TMP, "config-test")
-    await setup(testDir)
+    await fs.rm(TMP, { recursive: true, force: true })
+    await fs.mkdir(TMP, { recursive: true })
+
+    // ---- 关键隔离：把全局 OpenCode 配置目录指向 .test-tmp ----
+    // globalOpencodeConfigDir() 读取顺序：OPENCODE_CONFIG_DIR → XDG_CONFIG_HOME/opencode → ~/.config/opencode
+    // 不隔离的话，readOpencodeConfig 会向上找到用户真实的 ~/.config/opencode/opencode.json，
+    // 把真实 API Key 派生成规则写进测试临时目录（数据泄漏 + 用例不确定性）。
+    savedOpencodeConfigDir = process.env.OPENCODE_CONFIG_DIR
+    savedSecretConfig = process.env.OPENCODE_SECRET_CONFIG
+    isoGlobalDir = path.join(TMP, "global-isolated")
+    await fs.mkdir(isoGlobalDir, { recursive: true })
+    process.env.OPENCODE_CONFIG_DIR = isoGlobalDir
+    delete process.env.OPENCODE_SECRET_CONFIG
+  })
+
+  // OPENCODE_SECRET_CONFIG / OPENCODE_CONFIG_DIR 一旦被设置就会改变配置查找路径，
+  // 用例之间必须强制复位，否则一个用例的设置会静默改变后续用例的行为。
+  afterEach(() => {
+    delete process.env.OPENCODE_SECRET_CONFIG
+    process.env.OPENCODE_CONFIG_DIR = isoGlobalDir
   })
 
   after(async () => {
-    await fs.rm(testDir, { recursive: true, force: true })
+    if (savedOpencodeConfigDir === undefined) delete process.env.OPENCODE_CONFIG_DIR
+    else process.env.OPENCODE_CONFIG_DIR = savedOpencodeConfigDir
+    if (savedSecretConfig === undefined) delete process.env.OPENCODE_SECRET_CONFIG
+    else process.env.OPENCODE_SECRET_CONFIG = savedSecretConfig
+
+    for (const dir of createdDirs) await fs.rm(dir, { recursive: true, force: true })
+    // 兜底：整个子目录删掉，保证 .test-tmp 不留残留
+    await fs.rm(TMP, { recursive: true, force: true })
   })
 
-  it("无配置时自动生成默认配置", async () => {
-    // 设置 OPENCODE_SECRET_CONFIG 指向不存在的路径，避免受全局配置干扰
-    const oldEnv = process.env.OPENCODE_SECRET_CONFIG
-    const isoDir = path.join(TMP, "isolated-" + crypto.randomBytes(4).toString("hex"))
-    await fs.mkdir(isoDir, { recursive: true })
-    process.env.OPENCODE_SECRET_CONFIG = path.join(isoDir, "no-such-file.yaml")
+  // =============================================
+  // 配置加载
+  // =============================================
+  describe("配置加载", () => {
+    it("无配置时自动生成默认配置到 OPENCODE_SECRET_CONFIG 指向的路径", async () => {
+      const isoDir = await makeTmpDir("isolated")
+      process.env.OPENCODE_SECRET_CONFIG = path.join(isoDir, "no-such-file.yaml")
 
-    const { loadConfig } = await import("../src/config.js")
-    const log = { info: () => {}, debug: () => {}, warn: () => {} }
+      const { loadConfig } = await import("../src/config.js")
+      const cfg = await loadConfig(isoDir, NOOP_LOGGER)
 
-    const cfg = await loadConfig(isoDir, log)
+      assert.equal(cfg.enabled, true)
+      assert.equal(cfg.autoDiscovery, true)
+      assert.equal(cfg.prefix, "__OMOS_")
+      assert.equal(cfg.loadedFrom, path.join(isoDir, "no-such-file.yaml"))
 
-    assert.equal(cfg.enabled, true)
-    assert.equal(cfg.autoDiscovery, true)
-    assert.equal(cfg.prefix, "__OMOS_")
-    assert.ok(cfg.loadedFrom)
-    // 环境变量指定时生成到环境变量路径，否则生成到全局目录
-    assert.ok(
-      !process.env.OPENCODE_SECRET_CONFIG || cfg.loadedFrom.includes("isolated"),
-      "环境变量指定时应生成到环境变量指向的路径",
-    )
+      const content = await fs.readFile(cfg.loadedFrom, "utf8")
+      assert.ok(content.includes("auto_discovery: true"))
+      assert.ok(content.includes("OPENAI_KEY"))
 
-    // 确认文件已创建
-    const content = await fs.readFile(cfg.loadedFrom, "utf8")
-    assert.ok(content.includes("auto_discovery: true"))
-    assert.ok(content.includes("OPENAI_KEY"))
+      // OPENCODE_SECRET_CONFIG 一旦设置就只认该路径，必须当场撤销，否则污染后续用例
+      delete process.env.OPENCODE_SECRET_CONFIG
+    })
 
-    if (oldEnv) process.env.OPENCODE_SECRET_CONFIG = oldEnv
-    else delete process.env.OPENCODE_SECRET_CONFIG
-    await fs.rm(isoDir, { recursive: true, force: true })
+    it("无配置且无环境变量时生成到全局配置目录", async () => {
+      const dir = await makeTmpDir("generate")
+      const { loadConfig } = await import("../src/config.js")
+
+      const cfg = await loadConfig(dir, NOOP_LOGGER)
+      assert.equal(
+        cfg.loadedFrom,
+        path.join(isoGlobalDir, "oh-my-opensecret.yaml"),
+        "默认配置应生成到隔离后的全局配置目录",
+      )
+      assert.ok(existsSync(cfg.loadedFrom))
+      // 后续用例需要干净起点，删掉生成的默认配置
+      await fs.rm(cfg.loadedFrom, { force: true })
+    })
+
+    it("配置查找优先级：环境变量 > 项目根 > 项目 .opencode/ > 全局目录", async () => {
+      const { loadConfig } = await import("../src/config.js")
+      const projectDir = await makeTmpDir("lookup")
+      const globalCfg = path.join(isoGlobalDir, "oh-my-opensecret.yaml")
+      const dotCfg = path.join(projectDir, ".opencode", "oh-my-opensecret.yaml")
+      const rootCfg = path.join(projectDir, "oh-my-opensecret.yaml")
+
+      // 1) 只有全局目录有配置 → 命中第 4 级
+      await writeCfg(isoGlobalDir, 'placeholder_prefix: "__GLOBAL_"\n')
+      let cfg = await loadConfig(projectDir, NOOP_LOGGER)
+      assert.equal(cfg.prefix, "__GLOBAL_")
+      assert.equal(cfg.loadedFrom, globalCfg)
+
+      // 2) 项目 .opencode/ 也有 → 命中第 3 级
+      await fs.mkdir(path.join(projectDir, ".opencode"), { recursive: true })
+      await writeCfg(path.join(projectDir, ".opencode"), 'placeholder_prefix: "__DOT_"\n')
+      cfg = await loadConfig(projectDir, NOOP_LOGGER)
+      assert.equal(cfg.prefix, "__DOT_")
+      assert.equal(cfg.loadedFrom, dotCfg)
+
+      // 3) 项目根也有 → 命中第 2 级
+      await writeCfg(projectDir, 'placeholder_prefix: "__ROOT_"\n')
+      cfg = await loadConfig(projectDir, NOOP_LOGGER)
+      assert.equal(cfg.prefix, "__ROOT_")
+      assert.equal(cfg.loadedFrom, rootCfg)
+
+      // 4) 环境变量指定 → 命中第 1 级，且只认这一个路径
+      const envDir = await makeTmpDir("lookup-env")
+      await writeCfg(envDir, 'placeholder_prefix: "__ENV_"\n')
+      process.env.OPENCODE_SECRET_CONFIG = path.join(envDir, "oh-my-opensecret.yaml")
+      cfg = await loadConfig(projectDir, NOOP_LOGGER)
+      assert.equal(cfg.prefix, "__ENV_")
+      assert.equal(cfg.loadedFrom, path.join(envDir, "oh-my-opensecret.yaml"))
+    })
   })
 
-  it("自动发现 Opencode 配置中的 apiKey", async () => {
-    // 创建 mock Opencode 配置
-    const opencodeConfig = {
-      apiKey: "sk-test-key-123456789",
-      providers: {
-        openai: {
-          apiKey: "sk-abcdefghijklmnopqrstuvwxyz123456",
-        },
-        github: {
-          token: "ghp_testPersonalAccessToken123",
-        },
-      },
+  // =============================================
+  // 全局配置目录隔离（防止读取用户真实配置）
+  // =============================================
+  describe("全局 OpenCode 配置目录隔离", () => {
+    it("自动发现只扫描隔离目录里的 opencode.json，不读真实用户配置", async () => {
+      const dir = await makeTmpDir("iso-scan")
+      const fakeKey = "fake-iso-key-0001"
+      await fs.writeFile(
+        path.join(isoGlobalDir, "opencode.json"),
+        JSON.stringify({ providers: { fakeco: { apiKey: fakeKey } } }, null, 2),
+        "utf8",
+      )
+      await fs.writeFile(
+        path.join(dir, "oh-my-opensecret.yaml"),
+        "enabled: true\nauto_discovery: true\npatterns:\n  keywords: []\n  regex: []\n  builtin: []\n  exclude: []\n",
+        "utf8",
+      )
+
+      const { loadConfig } = await import("../src/config.js")
+      const cfg = await loadConfig(dir, NOOP_LOGGER)
+      const content = await fs.readFile(cfg.loadedFrom, "utf8")
+
+      const entries = reportEntries(content)
+      // 真实用户配置里有 4+ 个 apiKey；若隔离失效，报告条目数会 > 1
+      assert.equal(entries.length, 1, `报告应只有隔离目录里的 1 个敏感值，实际: ${JSON.stringify(entries)}`)
+      assert.ok(entries[0].includes("[providers.fakeco.apiKey]"), `报告条目应带配置路径: ${entries[0]}`)
+      assertNoFragment(content, fakeKey, "隔离扫描报告", 8)
+
+      await fs.rm(path.join(isoGlobalDir, "opencode.json"), { force: true })
+    })
+
+    it("OPENCODE_CONFIG_DIR 指向 .test-tmp，全局目录不是真实 HOME 目录", () => {
+      const realGlobal = path.join(os.homedir(), ".config", "opencode")
+      assert.notEqual(
+        path.resolve(isoGlobalDir),
+        path.resolve(realGlobal),
+        "隔离目录不得就是真实用户配置目录",
+      )
+      assert.ok(
+        path.resolve(isoGlobalDir).startsWith(path.resolve(TMP) + path.sep),
+        "隔离目录必须落在 .test-tmp 内",
+      )
+    })
+  })
+
+  // =============================================
+  // Auto-discovery 报告与规则
+  // =============================================
+  describe("Auto-discovery", () => {
+    it("生成的规则真能脱敏对应密钥，且报告不含任何原文片段", async () => {
+      const dir = await makeTmpDir("discovery")
+      const secrets = {
+        "apiKey": "sk-test-key-123456789",
+        "providers.openai.apiKey": "sk-abcdefghijklmnopqrstuvwxyz123456",
+        "providers.github.token": "ghp_testPersonalAccessToken123",
+      }
+      await fs.writeFile(
+        path.join(dir, "opencode.json"),
+        JSON.stringify(
+          {
+            apiKey: secrets["apiKey"],
+            providers: {
+              openai: { apiKey: secrets["providers.openai.apiKey"] },
+              github: { token: secrets["providers.github.token"] },
+            },
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      )
+      await fs.writeFile(
+        path.join(dir, "oh-my-opensecret.yaml"),
+        "enabled: true\nauto_discovery: true\npatterns:\n  keywords: []\n  regex: []\n  builtin: []\n  exclude: []\n",
+        "utf8",
+      )
+
+      const { loadConfig } = await import("../src/config.js")
+      const { buildPatternSet } = await import("../src/patterns.js")
+      const { redactText } = await import("../src/engine.js")
+      const { PlaceholderSession } = await import("../src/session.js")
+
+      const cfg = await loadConfig(dir, NOOP_LOGGER)
+      const content = await fs.readFile(cfg.loadedFrom, "utf8")
+
+      // 1) 报告块存在，且每个敏感值都有一条带配置路径的条目
+      assert.ok(content.includes("auto-discovered"), "配置中应包含自动发现的注释标记")
+      const entries = reportEntries(content)
+      assert.equal(entries.length, Object.keys(secrets).length, `报告条目数不符: ${JSON.stringify(entries)}`)
+      for (const [secretPath, value] of Object.entries(secrets)) {
+        const entry = entries.find((l) => l.includes(`[${secretPath}]`))
+        assert.ok(entry, `报告缺少 ${secretPath} 的条目`)
+        assert.ok(entry.includes("✅"), `派生新规则后应标记已覆盖: ${entry}`)
+        assert.ok(!entry.includes(value.slice(0, 6)), `报告条目不得含原文片段: ${entry}`)
+      }
+
+      // 2) 报告与规则整体不得含任何 >=8 字符原文片段
+      for (const [secretPath, value] of Object.entries(secrets)) {
+        assertNoFragment(content, value, `配置文件(${secretPath})`, 8)
+      }
+
+      // 3) 生成的规则跑起来必须真能脱敏（报告判定与运行时行为一致）
+      const patterns = buildPatternSet(cfg.patterns)
+      const session = new PlaceholderSession({ prefix: cfg.prefix, ttlMs: cfg.ttlMs, maxMappings: 1000 })
+      for (const [secretPath, value] of Object.entries(secrets)) {
+        const redacted = redactText(`token=${value}`, patterns, session).text
+        assert.ok(redacted.includes("__OMOS_"), `${secretPath} 应被自动生成的规则脱敏: ${redacted}`)
+        assertNoFragment(redacted, value, `运行时脱敏(${secretPath})`, 8)
+      }
+    })
+
+    it("已被同 id 规则占用的值保持未覆盖，报告写明长度且不含原文片段", async () => {
+      const dir = await makeTmpDir("discovery-uncovered")
+      // 取与报告样板（opencode.json / auto-discovered / placeholder-id 等）无任何
+      // 3 字符公共片段的值，否则下面的 3 字符片段扫描会命中报告自身的合法内容
+      const key = "Zt7qR9xLm2Vb9Lp"
+      await fs.writeFile(path.join(dir, "opencode.json"), JSON.stringify({ apiKey: key }), "utf8")
+      // 已存在同名 placeholder-id → 派生规则被跳过 → 该值保持 ❌ 未覆盖
+      await fs.writeFile(
+        path.join(dir, "oh-my-opensecret.yaml"),
+        "enabled: true\nauto_discovery: true\npatterns:\n" +
+          '  regex:\n    - { pattern: "existing-rule", placeholder-id: "APIKEY_KEY" }\n' +
+          "  keywords: []\n  builtin: []\n  exclude: []\n",
+        "utf8",
+      )
+
+      const { loadConfig } = await import("../src/config.js")
+      const cfg = await loadConfig(dir, NOOP_LOGGER)
+      const content = await fs.readFile(cfg.loadedFrom, "utf8")
+
+      assert.ok(content.includes("existing-rule"), "用户已有规则应保留")
+      const entry = reportEntries(content).find((l) => l.includes("[apiKey]"))
+      assert.ok(entry, "报告应有 apiKey 条目")
+      assert.ok(entry.includes("❌"), `占位 id 已存在的值应保持未覆盖: ${entry}`)
+      assert.ok(entry.includes(`${key.length} 字符`), `未覆盖条目应写明长度: ${entry}`)
+
+      // 未覆盖分支同样不得写任何原文片段（>=3 字符即失败）
+      const reportText = content
+        .split("\n")
+        .filter((l) => l.trimStart().startsWith("#"))
+        .join("\n")
+      for (let i = 0; i + 3 <= key.length; i++) {
+        const frag = key.slice(i, i + 3)
+        assert.ok(!reportText.includes(frag), `报告块残留原文片段 "${frag}"`)
+      }
+    })
+
+    it("报告判定 covered 时，运行时必须真能脱敏该值（/…/i 与 (?i) flags 一致）", async () => {
+      const dir = await makeTmpDir("discovery-flags")
+      const literalKey = "SECT-AB12"   // 大写，只靠 /…/i 的 i 标志才能命中
+      const inlineKey = "INLINE-Xy99"  // 只靠 (?i) 内联前缀才能命中
+      await fs.writeFile(
+        path.join(dir, "opencode.json"),
+        JSON.stringify({ providers: { sect: { apiKey: literalKey }, inline: { apiKey: inlineKey } } }),
+        "utf8",
+      )
+      await fs.writeFile(
+        path.join(dir, "oh-my-opensecret.yaml"),
+        "enabled: true\nauto_discovery: true\npatterns:\n" +
+          '  regex:\n    - { pattern: "/sect-[a-z0-9]{4}/i", placeholder-id: "SECT_LITERAL" }\n' +
+          '    - { pattern: "(?i)INLINE-[a-z0-9]{4}", placeholder-id: "INLINE_FLAG" }\n' +
+          "  keywords: []\n  builtin: []\n  exclude: []\n",
+        "utf8",
+      )
+
+      const { loadConfig } = await import("../src/config.js")
+      const { buildPatternSet } = await import("../src/patterns.js")
+      const { redactText } = await import("../src/engine.js")
+      const { PlaceholderSession } = await import("../src/session.js")
+
+      const cfg = await loadConfig(dir, NOOP_LOGGER)
+      const content = await fs.readFile(cfg.loadedFrom, "utf8")
+
+      const entries = reportEntries(content)
+      for (const [secretPath, value] of [
+        ["providers.sect.apiKey", literalKey],
+        ["providers.inline.apiKey", inlineKey],
+      ]) {
+        const entry = entries.find((l) => l.includes(`[${secretPath}]`))
+        assert.ok(entry, `报告缺少 ${secretPath} 的条目`)
+        assert.ok(entry.includes("✅"), `${secretPath} 应判定为已覆盖: ${entry}`)
+        // 报告会指名命中的规则 id（"✅ 已匹配 <id>"），这是刻意设计——告诉用户哪条规则覆盖了该值。
+        // 本用例的 id 由测试自己写入、且与密钥共享前缀，扫描前先剔除，否则无法区分
+        // 「config.js 泄漏了密钥」与「报告回显了测试自写的规则 id」。
+        let reportText = entries.join("\n")
+        for (const authoredId of ["SECT_LITERAL", "INLINE_FLAG"]) {
+          reportText = reportText.split(authoredId).join("<id>")
+        }
+        assertNoFragment(reportText, value, `扫描报告(${secretPath})`, 6)
+        assert.ok(!content.includes(value), `配置文件(${secretPath}): 不得残留完整原文`)
+      }
+
+      // 报告说 covered，运行时就必须脱敏成功——这正是此前「报告撒谎」的回归点
+      const patterns = buildPatternSet(cfg.patterns)
+      const session = new PlaceholderSession({ prefix: cfg.prefix, ttlMs: cfg.ttlMs, maxMappings: 1000 })
+      for (const value of [literalKey, inlineKey]) {
+        const redacted = redactText(`token=${value}`, patterns, session).text
+        assert.ok(redacted.includes("__OMOS_"), `${value} 应被脱敏: ${redacted}`)
+        assert.ok(!redacted.includes(value), `${value} 不得明文残留: ${redacted}`)
+      }
+    })
+
+    it("短密钥（8~12 字符）的报告不含原文片段", async () => {
+      const dir = await makeTmpDir("discovery-short")
+      const secrets = {
+        "providers.len8.apiKey": "abcd1234",
+        "providers.len9.apiKey": "abcd12345",
+        "providers.len10.apiKey": "abcd123456",
+        "providers.len11.apiKey": "abcd1234567",
+        "providers.len12.apiKey": "abcd12345678",
+      }
+      await fs.writeFile(path.join(dir, "opencode.json"), JSON.stringify({ providers: { len8: { apiKey: secrets["providers.len8.apiKey"] }, len9: { apiKey: secrets["providers.len9.apiKey"] }, len10: { apiKey: secrets["providers.len10.apiKey"] }, len11: { apiKey: secrets["providers.len11.apiKey"] }, len12: { apiKey: secrets["providers.len12.apiKey"] } } }), "utf8")
+      await fs.writeFile(
+        path.join(dir, "oh-my-opensecret.yaml"),
+        "enabled: true\nauto_discovery: true\npatterns:\n  keywords: []\n  regex: []\n  builtin: []\n  exclude: []\n",
+        "utf8",
+      )
+
+      const { loadConfig } = await import("../src/config.js")
+      const cfg = await loadConfig(dir, NOOP_LOGGER)
+      const content = await fs.readFile(cfg.loadedFrom, "utf8")
+
+      const entries = reportEntries(content)
+      assert.equal(entries.length, Object.keys(secrets).length, `报告条目数不符: ${JSON.stringify(entries)}`)
+      for (const [secretPath, value] of Object.entries(secrets)) {
+        const entry = entries.find((l) => l.includes(`[${secretPath}]`))
+        assert.ok(entry, `报告缺少 ${secretPath} 的条目`)
+        assert.ok(entry.includes(`${value.length} 字符`) || entry.includes("✅"), `条目应带长度或覆盖标记: ${entry}`)
+        assertNoFragment(content, value, `配置文件(${secretPath})`, 8)
+      }
+    })
+
+    it("连续两次自动发现：报告块唯一、文件头分隔线不被破坏、新条目不插到文件头", async () => {
+      const dir = await makeTmpDir("discovery-report")
+      const cfgPath = path.join(dir, "oh-my-opensecret.yaml")
+      const header = "# ============================================"
+      const ownHeader = "# 这是配置文件自己的头部注释"
+
+      await fs.writeFile(
+        cfgPath,
+        `${header}\n${ownHeader}\nenabled: true\nauto_discovery: true\n` +
+          "patterns:\n  keywords: []\n  regex: []\n  builtin: []\n  exclude: []\n",
+        "utf8",
+      )
+      await fs.writeFile(
+        path.join(dir, "opencode.json"),
+        JSON.stringify({ providers: { alpha: { apiKey: "alpha-secret-key-0001" } } }),
+        "utf8",
+      )
+
+      const { loadConfig } = await import("../src/config.js")
+      await loadConfig(dir, NOOP_LOGGER)
+
+      // 第二轮：新增一个敏感值
+      await fs.writeFile(
+        path.join(dir, "opencode.json"),
+        JSON.stringify({
+          providers: {
+            alpha: { apiKey: "alpha-secret-key-0001" },
+            bravo: { apiKey: "bravo-secret-key-0002" },
+          },
+        }),
+        "utf8",
+      )
+      await loadConfig(dir, NOOP_LOGGER)
+      // 第三轮：无变化，确认幂等
+      await loadConfig(dir, NOOP_LOGGER)
+
+      const lines = (await fs.readFile(cfgPath, "utf8")).split("\n")
+
+      // 报告块只能有一个（此前锚点是文件头分隔线子串，每轮顶高一格）
+      assert.equal(lines.filter((l) => l.includes("auto-discovered: 扫描报告")).length, 1, "扫描报告块只能有一个")
+      // 报告尾部分隔线（比配置文件自己的分隔线短一个 =）只能有一个
+      assert.equal(lines.filter((l) => l === "# =========================================").length, 1, "报告尾部分隔线只能有一个")
+      // 文件头未被破坏
+      assert.equal(lines[0], header, "配置文件首行必须是它自己的分隔线")
+      assert.equal(lines[1], ownHeader, "配置文件头部注释必须保持在原位")
+      assert.equal(lines.filter((l) => l === header).length, 1, "配置文件分隔线只能出现一次")
+
+      const reportIdx = lines.findIndex((l) => l.includes("auto-discovered: 扫描报告"))
+      const patternsIdx = lines.findIndex((l) => l.startsWith("patterns:"))
+      assert.ok(reportIdx > 2, `报告块不得被插到文件头，实际行号 ${reportIdx}`)
+      assert.ok(reportIdx < patternsIdx, `报告块应位于 patterns: 之前，实际 ${reportIdx} vs ${patternsIdx}`)
+
+      const content = lines.join("\n")
+      const entries = reportEntries(content)
+      assert.equal(entries.length, 2, `两轮后应恰好 2 条报告条目: ${JSON.stringify(entries)}`)
+      assert.ok(entries.some((l) => l.includes("[providers.alpha.apiKey]")))
+      assert.ok(entries.some((l) => l.includes("[providers.bravo.apiKey]")))
+      assert.equal(
+        lines.filter((l) => l.includes("# auto-generated for:")).length,
+        2,
+        "两条规则各出现一次，第三轮不应重复追加",
+      )
+      assertNoFragment(content, "alpha-secret-key-0001", "配置文件(alpha)", 8)
+      assertNoFragment(content, "bravo-secret-key-0002", "配置文件(bravo)", 8)
+    })
+  })
+
+  // =============================================
+  // fail-fast 校验
+  // =============================================
+  describe("非法配置必须抛错（不得静默回落默认值）", () => {
+    const invalidCases = [
+      ["patterns.regex 写成字符串", 'patterns:\n  regex: "not-an-array"\n', /patterns\.regex must be an array/],
+      ["patterns.exclude 写成对象", "patterns:\n  exclude: { a: 1 }\n", /patterns\.exclude must be an array/],
+      ["patterns 写成数组", "patterns:\n  - a\n", /patterns must be an object/],
+      ["logging.level 非法", 'logging:\n  level: "verbose"\n', /logging\.level must be one of/],
+      ["logging.level 写 off（配置白名单不含 off）", 'logging:\n  level: "off"\n', /logging\.level must be one of/],
+      ["logging 写成字符串", 'logging: "info"\n', /logging must be an object/],
+      ["logging.file 非字符串", "logging:\n  file: 123\n", /logging\.file must be a string/],
+      ["rotation.max_files 非正整数", "logging:\n  rotation:\n    max_files: 0\n", /max_files must be a positive integer/],
+      ["rotation.max_size 类型非法", "logging:\n  rotation:\n    max_size: true\n", /max_size must be a string or number/],
+      ["session.ttl 格式非法", 'session:\n  ttl: "1 hour"\n', /session\.ttl 格式非法/],
+      ["session.ttl 非字符串", "session:\n  ttl: 3600\n", /session\.ttl must be a string/],
+      ["session.max_mappings 非正数", "session:\n  max_mappings: 0\n", /max_mappings must be a positive number/],
+      ["enabled 非布尔", 'enabled: "yes"\n', /enabled must be a boolean/],
+      ["auto_discovery 非布尔", 'auto_discovery: "true"\n', /auto_discovery must be a boolean/],
+      ["placeholder_prefix 为空", 'placeholder_prefix: ""\n', /placeholder_prefix must be a non-empty string/],
+      ["正则规则无法编译", 'patterns:\n  regex:\n    - { pattern: "/[unclosed/i", placeholder-id: "BAD" }\n', /规则非法/],
+    ]
+
+    for (const [name, cfgYaml, expected] of invalidCases) {
+      it(name, async () => {
+        const dir = await makeTmpDir("invalid")
+        await fs.writeFile(path.join(dir, "oh-my-opensecret.yaml"), cfgYaml, "utf8")
+        const { loadConfig } = await import("../src/config.js")
+        await assert.rejects(() => loadConfig(dir, NOOP_LOGGER), expected)
+      })
     }
-    await fs.writeFile(
-      path.join(testDir, "opencode.json"),
-      JSON.stringify(opencodeConfig, null, 2),
-      "utf8",
-    )
 
-    // 设环境变量隔离，避免加载全局配置
-    const oldEnv = process.env.OPENCODE_SECRET_CONFIG
-    process.env.OPENCODE_SECRET_CONFIG = path.join(testDir, "nonexistent.yaml")
+    it("YAML 语法错误", async () => {
+      const dir = await makeTmpDir("invalid-yaml")
+      await fs.writeFile(path.join(dir, "oh-my-opensecret.yaml"), "patterns: [\n  regex: {oops\n", "utf8")
+      const { loadConfig } = await import("../src/config.js")
+      await assert.rejects(() => loadConfig(dir, NOOP_LOGGER))
+    })
 
-    const { loadConfig } = await import("../src/config.js")
-    const log = { info: () => {}, debug: () => {}, warn: () => {} }
-    const cfg = await loadConfig(testDir, log)
-
-    // 确认自动发现的未覆盖值以注释写入配置文件
-    const content = await fs.readFile(cfg.loadedFrom, "utf8")
-    assert.ok(content.includes("auto-discovered"), "未覆盖的敏感值应以注释标记")
-    // 不应包含原文
-    assert.ok(!content.includes("sk-test-key"), "不应包含原文")
-    assert.ok(!content.includes("sk-abcdefghijklmnopqrstuvwxyz123456"), "不应包含原文")
-
-    if (oldEnv) process.env.OPENCODE_SECRET_CONFIG = oldEnv
-    else delete process.env.OPENCODE_SECRET_CONFIG
+    it("配置内容不是映射", async () => {
+      const dir = await makeTmpDir("invalid-shape")
+      await fs.writeFile(path.join(dir, "oh-my-opensecret.yaml"), "- a\n- b\n", "utf8")
+      const { loadConfig } = await import("../src/config.js")
+      await assert.rejects(() => loadConfig(dir, NOOP_LOGGER), /必须是 YAML 映射/)
+    })
   })
 
-  it("4 级配置查找优先级正确", async () => {
-    const subDir = path.join(TMP, "lookup-test")
-    await setup(subDir)
-
-    // 在 project root 放一个配置
-    const projectCfg = { enabled: true, logging: { level: "debug" }, placeholder_prefix: "__TEST_" }
-    await fs.writeFile(path.join(subDir, "oh-my-opensecret.yaml"), JSON.stringify(projectCfg), "utf8")
-
-    const { loadConfig } = await import("../src/config.js")
-    const log = { info: () => {}, debug: () => {}, warn: () => {} }
-    const cfg = await loadConfig(subDir, log)
-
-    assert.ok(cfg.loadedFrom.includes("oh-my-opensecret.yaml"))
+  // =============================================
+  // 时长解析
+  // =============================================
+  describe("session.ttl 归一化", () => {
+    it("合法时长换算为毫秒，缺失用默认 1h", async () => {
+      const { loadConfig } = await import("../src/config.js")
+      const cases = [
+        ["500ms", 500],
+        ["30s", 30_000],
+        ["15m", 900_000],
+        ["2h", 7_200_000],
+        ["1d", 86_400_000],
+        [undefined, 3_600_000],
+      ]
+      for (const [ttl, expected] of cases) {
+        const dir = await makeTmpDir("ttl")
+        await writeCfg(dir, ttl === undefined ? "" : `session:\n  ttl: "${ttl}"\n`)
+        const cfg = await loadConfig(dir, NOOP_LOGGER)
+        assert.equal(cfg.ttlMs, expected, `ttl=${ttl} 应换算为 ${expected}ms`)
+      }
+    })
   })
 })
 
 describe("logger.js", () => {
-  it("分级日志：level 过滤正确", async () => {
+  const LOG_TMP = path.join(TMP, "logger")
+
+  before(async () => {
+    await fs.mkdir(LOG_TMP, { recursive: true })
+  })
+
+  after(async () => {
+    await fs.rm(LOG_TMP, { recursive: true, force: true })
+  })
+
+  async function logFilePath(name) {
+    return path.join(LOG_TMP, name)
+  }
+
+  it("分级日志：level 过滤正确（debug/info 不落盘，warn 落盘）", async () => {
     const { Logger } = await import("../src/logger.js")
-    const tmpLog = path.join(TMP, "logger-level-test.log")
-    await fs.rm(tmpLog, { force: true })
+    const tmpLog = await logFilePath("level-test.log")
 
     const log = new Logger({ level: "warn", filePath: tmpLog })
-    log.debug("should not appear")
-    log.info("should not appear either")
+    // 两条消息刻意用不互相包含的字符串，否则后一条断言会被前一条覆盖、永远不会执行
+    log.debug("zzz-debug-level-marker zzz")
+    log.info("zzz-info-level-marker zzz")
     log.warn("test warning")
-
+    log.error("test error")
     await log.flush()
 
     const content = await fs.readFile(tmpLog, "utf8")
-    assert.ok(!content.includes("should not appear"), "debug 级别的日志不应输出")
-    assert.ok(!content.includes("should not appear either"), "info 级别的日志不应输出")
-    assert.ok(content.includes("test warning"), "warn 级别的日志应输出")
-    await fs.rm(tmpLog, { force: true })
+    assert.ok(!content.includes("zzz-debug-level-marker"), "debug 级别不应落盘")
+    assert.ok(!content.includes("zzz-info-level-marker"), "info 级别不应落盘")
+    assert.ok(content.includes("test warning"), "warn 级别应落盘")
+    assert.ok(content.includes("test error"), "error 级别应落盘")
   })
+
+  it("level=off 时全部不落盘，且不创建日志文件", async () => {
+    const { Logger } = await import("../src/logger.js")
+    const tmpLog = await logFilePath("off-test.log")
+
+    const log = new Logger({ level: "off", filePath: tmpLog })
+    log.error("off-level-error-marker")
+    log.warn("off-level-warn-marker")
+    await log.flush()
+
+    assert.ok(!existsSync(tmpLog), "level=off 不应创建日志文件")
+  })
+
+  it("applyConfig 归一化：level 名→数值、maxSize 字符串→字节数", async () => {
+    const { Logger } = await import("../src/logger.js")
+    const log = new Logger({ level: "off" })
+    log.applyConfig({ level: "warn", file: await logFilePath("apply.log"), maxSize: "10m", maxFiles: 3 })
+
+    assert.equal(log.level, 2, "warn 应映射为数值 2")
+    assert.equal(log.maxSize, 10 * 1024 * 1024, '"10m" 应换算为 10485760 字节')
+    assert.equal(log.maxFiles, 3)
+
+    log.applyConfig({ level: "debug", file: await logFilePath("apply2.log"), maxSize: "500k" })
+    assert.equal(log.level, 0, "debug 应映射为数值 0")
+    assert.equal(log.maxSize, 500 * 1024)
+  })
+
+  it("applyConfig 展开 ~ 为 $HOME，不产生字面量 ~ 目录", async () => {
+    const { Logger } = await import("../src/logger.js")
+    const log = new Logger({ level: "off" })
+    log.applyConfig({ level: "off", file: "~/x.log", maxSize: "10m" })
+
+    assert.equal(log.filePath, path.join(os.homedir(), "x.log"), "~ 必须展开为 $HOME")
+    assert.ok(!log.filePath.includes("~"), `路径不得残留字面量 ~: ${log.filePath}`)
+    assert.ok(!existsSync(path.join(process.cwd(), "~")), "不得创建字面量 ~ 目录")
+    assert.ok(!existsSync(path.join(process.cwd(), "~/x.log")), "不得在字面量 ~ 目录下写日志")
+  })
+
+  it("非法 level / max_size / 单位抛错，不静默回落默认值", async () => {
+    const { Logger } = await import("../src/logger.js")
+    const log = new Logger({ level: "off" })
+    const file = await logFilePath("invalid.log")
+
+    assert.throws(() => log.applyConfig({ level: "verbose", file, maxSize: "10m" }), /未知的日志级别/)
+    assert.throws(() => log.applyConfig({ level: "trace", file, maxSize: "10m" }), /未知的日志级别/)
+    assert.throws(() => log.applyConfig({ level: "info", file, maxSize: "10x" }), /未知的日志大小单位/)
+    assert.throws(() => log.applyConfig({ level: "info", file, maxSize: "10mb" }), /未知的日志大小单位/)
+    assert.throws(() => log.applyConfig({ level: "info", file, maxSize: "big" }), /无法解析日志大小/)
+    assert.throws(() => log.applyConfig({ level: "info", file, maxSize: -1 }), /日志大小非法/)
+    assert.throws(() => log.applyConfig({ level: "info", file, maxSize: 0 }), /日志大小非法/)
+    assert.throws(() => new Logger({ level: "verbose" }), /未知的日志级别/)
+
+    // 抛错后字段不应被改成非法值
+    assert.equal(log.level, 4, "非法 applyConfig 不应改动已生效的 level")
+  })
+})
+
+// 文件级兜底清理：放在所有 describe 之外，确保最后执行。
+// 各 describe 的 after 只能删自己的子目录，先执行的 describe 删掉 TMP 后，
+// 后执行的 describe 又会重建——只靠 describe 级 after 会留下空目录。
+after(async () => {
+  await fs.rm(TMP, { recursive: true, force: true })
 })

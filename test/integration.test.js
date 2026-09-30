@@ -58,8 +58,8 @@ describe("index.js - V2 插件入口集成", () => {
 
     // ---- 测试 3: 工具参数还原（execute.before hook 等价物）----
     const input = { command: `echo ${afterRedact}` }
-    restoreInput(input, session)
-    assert.equal(input.command, "echo My key is my-secret")
+    const restoredInput = restoreInput(input, session)
+    assert.equal(restoredInput.command, "echo My key is my-secret")
   })
 
   after(async () => {
