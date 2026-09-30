@@ -1,5 +1,15 @@
 # OpenCode 右侧栏插件能力研究报告
 
+> [!WARNING]
+> **存档文档，已失效，请勿据此开发。**
+> - 报告基于 **OpenCode v1.15.13（2026-06-04）** 的运行时观察。
+> - 研究目标依赖的 `src/tui/` 代码**从未实现**（仓库中不存在该目录）。
+> - OpenCode 已迁移到 **V2 插件 API**（`Plugin.define({ id, setup })` + `ctx.*.hook()`），本文的 hook 名、入口形态、上下文结构全部不再适用。
+> - 保留原因：V2 的 TUI 侧能力调研尚未重做，此文的提问方式与验证方法可复用。
+> - 当前有效文档：`AGENTS.md`、`doc/01-design-reference.md`、`doc/02-plugin-api-reference.md`。
+
+---
+
 > 日期：2026-06-04
 > 目标：研究是否能在 OpenCode 右侧栏区域中给 oh-my-opensecret 插件显示脱敏信息面板
 
