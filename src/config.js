@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto"
 import { existsSync } from "node:fs"
 import * as fs from "node:fs/promises"
 import os from "node:os"
@@ -358,11 +359,17 @@ patterns:
 
 /**
  * 以 tmp + rename 方式写文件，避免并发进程互相抢文件、以及写一半留下损坏文件。
+ *
+ * tmp 名必须保证「进程内 + 跨进程」全局唯一：插件在每个 location 各实例化一份
+ * （注册在全局 opencode.json，宿主按 location 加载），多份实例会在同一进程内并发
+ * 调 loadConfig 写同一个配置文件。只用 pid + 毫秒不够——同进程同毫秒并发会撞名：
+ * 先完成的 rename 拿走 tmp，后到的 rename 找不到文件即 ENOENT，导致该 location
+ * 插件加载失败、无脱敏保护。
  * @param {string} targetPath
  * @param {string} content
  */
-async function writeFileAtomic(targetPath, content) {
-  const tmpPath = `${targetPath}.${process.pid}.${Date.now()}.tmp`
+export async function writeFileAtomic(targetPath, content) {
+  const tmpPath = `${targetPath}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`
   try {
     await fs.writeFile(tmpPath, content, "utf8")
     await fs.rename(tmpPath, targetPath)

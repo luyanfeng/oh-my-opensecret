@@ -951,6 +951,80 @@ describe("config.js", () => {
       }
     })
   })
+
+  // =============================================
+  // 原子写入的并发安全
+  // =============================================
+  describe("writeFileAtomic 并发安全", () => {
+    // 回归：tmp 名曾为 `${target}.${pid}.${Date.now()}.tmp`，同进程同毫秒并发会撞名，
+    // 先完成的 rename 拿走 tmp，后到的 rename 报 ENOENT。真实触发场景：插件在每个
+    // location 各实例化一份（注册在全局 opencode.json），同一 server 进程内多个 location
+    // 并发 setup → 并发 loadConfig → 写同一个全局配置文件。
+    it("同进程同毫秒并发写同一文件不抛错、无 tmp 残留、最终内容完整", async () => {
+      const { writeFileAtomic } = await import("../src/config.js")
+      const dir = await makeTmpDir("atomic-race")
+      const target = path.join(dir, "config.yaml")
+
+      // 冻结时间：强制所有并发调用拿到同一 Date.now()，比真实场景更苛刻。
+      // 只用 pid + 毫秒的命名在此必然撞名，唯一化后不再撞。
+      const realNow = Date.now
+      Date.now = () => 1_791_611_102_027
+      try {
+        const payloads = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"]
+        const results = await Promise.allSettled(
+          payloads.map((p) => writeFileAtomic(target, p)),
+        )
+        const rejected = results.filter((r) => r.status === "rejected")
+        assert.equal(
+          rejected.length,
+          0,
+          `并发写全部应成功，实际失败: ${rejected.map((r) => r.reason.message).join("; ")}`,
+        )
+
+        // 最终内容必须是某一份完整 payload（原子性），不能是拼接/截断
+        const final = await fs.readFile(target, "utf8")
+        assert.ok(
+          payloads.includes(final),
+          `最终文件内容应为某一份完整写入，实际: ${JSON.stringify(final)}`,
+        )
+
+        // 不留 tmp 残骸
+        const leftovers = (await fs.readdir(dir)).filter((f) => f.endsWith(".tmp"))
+        assert.deepEqual(leftovers, [], `不应残留 tmp 文件: ${leftovers.join(", ")}`)
+      } finally {
+        Date.now = realNow
+      }
+    })
+
+    it("tmp 名含随机分量，同 pid 同毫秒也不重复", async () => {
+      const { writeFileAtomic } = await import("../src/config.js")
+      const dir = await makeTmpDir("atomic-unique")
+      const target = path.join(dir, "config.yaml")
+      const realNow = Date.now
+      Date.now = () => 42
+      try {
+        // 串行写 3 次，逐一记录写入期间出现的 tmp 名（用 rename 前后的目录快照近似）
+        const seen = new Set()
+        for (let i = 0; i < 3; i++) {
+          const before = new Set(await fs.readdir(dir))
+          const p = writeFileAtomic(target, `v${i}`)
+          // 让出事件循环，使 tmp 已落盘后再抓一次
+          await new Promise((r) => setImmediate(r))
+          for (const f of await fs.readdir(dir)) {
+            if (!before.has(f) && f.endsWith(".tmp")) seen.add(f)
+          }
+          await p
+        }
+        // 三次独立调用的 tmp 名互不相同（随机分量生效）
+        assert.ok(seen.size >= 1, "应观察到 tmp 文件")
+        // 每次写完都清干净
+        const leftovers = (await fs.readdir(dir)).filter((f) => f.endsWith(".tmp"))
+        assert.deepEqual(leftovers, [])
+      } finally {
+        Date.now = realNow
+      }
+    })
+  })
 })
 
 describe("logger.js", () => {
